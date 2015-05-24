@@ -270,6 +270,10 @@ void GCNPassConfig::addPreRegAlloc() {
     initializeSILoadStoreOptimizerPass(*PassRegistry::getPassRegistry());
     insertPass(&MachineSchedulerID, &SILoadStoreOptimizerID);
   }
+  if (getOptLevel() > CodeGenOpt::None) {
+    initializeSILoadBufferOptimizerPass(*PassRegistry::getPassRegistry());
+    insertPass(&MachineSchedulerID, &SILoadBufferOptimizerID);
+  }
   addPass(createSIShrinkInstructionsPass(), false);
   addPass(createSIFixSGPRLiveRangesPass(), false);
 }
