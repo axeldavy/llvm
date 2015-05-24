@@ -445,6 +445,16 @@ def FP_HALF : PatLeaf <
   [{return N->isExactlyValue(0.5);}]
 >;
 
+def FP_F32MAX : PatLeaf <
+  (fpimm),
+  [{return N->isExactlyValue(BitsToFloat(0x7f7fffff));}]
+>;
+
+def FP_F32MIN : PatLeaf <
+  (fpimm),
+  [{return N->isExactlyValue(BitsToFloat(0xff7fffff));}]
+>;
+
 let isCodeGenOnly = 1, isPseudo = 1 in {
 
 let usesCustomInserter = 1  in {
