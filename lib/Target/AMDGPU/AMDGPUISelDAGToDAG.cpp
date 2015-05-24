@@ -110,10 +110,10 @@ private:
                          SDValue &Offset, SDValue &GLC) const;
   SDNode *SelectAddrSpaceCast(SDNode *N);
   bool SelectVOP3Mods(SDValue In, SDValue &Src, SDValue &SrcMods) const;
-  bool SelectVOP3Mods0(SDValue In, SDValue &Src, SDValue &SrcMods,
+  bool SelectVOP3Mods0(SDNode *Parent, SDValue In, SDValue &Src, SDValue &SrcMods,
                        SDValue &Clamp, SDValue &Omod) const;
 
-  bool SelectVOP3Mods0Clamp(SDValue In, SDValue &Src, SDValue &SrcMods,
+  bool SelectVOP3Mods0Clamp(SDNode *Parent, SDValue In, SDValue &Src, SDValue &SrcMods,
                             SDValue &Omod) const;
   bool SelectVOP3Mods0Clamp0OMod(SDValue In, SDValue &Src, SDValue &SrcMods,
                                  SDValue &Clamp,
@@ -847,7 +847,7 @@ SDNode *AMDGPUDAGToDAGISel::SelectDIV_SCALE(SDNode *N) {
   // src0_modifiers, src0, src1_modifiers, src1, src2_modifiers, src2, clamp, omod
   SDValue Ops[8];
 
-  SelectVOP3Mods0(N->getOperand(0), Ops[1], Ops[0], Ops[6], Ops[7]);
+  SelectVOP3Mods0(NULL, N->getOperand(0), Ops[1], Ops[0], Ops[6], Ops[7]);
   SelectVOP3Mods(N->getOperand(1), Ops[3], Ops[2]);
   SelectVOP3Mods(N->getOperand(2), Ops[5], Ops[4]);
   return CurDAG->SelectNodeTo(N, Opc, VT, MVT::i1, Ops);
@@ -1316,24 +1316,108 @@ bool AMDGPUDAGToDAGISel::SelectVOP3Mods(SDValue In, SDValue &Src,
   return true;
 }
 
-bool AMDGPUDAGToDAGISel::SelectVOP3Mods0(SDValue In, SDValue &Src,
+bool AMDGPUDAGToDAGISel::SelectVOP3Mods0(SDNode *Parent, SDValue In, SDValue &Src,
                                          SDValue &SrcMods, SDValue &Clamp,
                                          SDValue &Omod) const {
-  SDLoc DL(In);
-  // FIXME: Handle Clamp and Omod
-  Clamp = CurDAG->getTargetConstant(0, DL, MVT::i32);
-  Omod = CurDAG->getTargetConstant(0, DL, MVT::i32);
+  unsigned mod = SIOutMods::NONE;
+  unsigned clamp = 0;
 
-  return SelectVOP3Mods(In, Src, SrcMods);
+  SDNode *ParentUser = NULL;
+
+  if (!SelectVOP3Mods(In, Src, SrcMods))
+      return false;
+
+  if (Parent && Parent->hasOneUse())
+      ParentUser = *Parent->use_begin();
+
+  if (ParentUser && ParentUser->getNumValues() == 1) {
+    SDValue User = SDValue(ParentUser, 0);
+    if (User.isMachineOpcode() &&
+        User.getMachineOpcode() == AMDGPU::V_ADD_F32_e64) {
+      ConstantSDNode *Const1 = dyn_cast<ConstantSDNode>(User->getOperand(0)); // src0 modifier
+      ConstantSDNode *Const2 = dyn_cast<ConstantSDNode>(User->getOperand(2)); // src1 modifier
+      ConstantSDNode *Const3 = dyn_cast<ConstantSDNode>(User->getOperand(3)); // src1 value (we catch constant 0)
+      ConstantSDNode *Const4 = dyn_cast<ConstantSDNode>(User->getOperand(4)); // clamp bit
+      ConstantSDNode *Const5 = dyn_cast<ConstantSDNode>(User->getOperand(5)); // omod bit
+      if (Const1 && Const2 && Const3 && Const4 && Const5 &&
+          Const1->isNullValue() && Const2->isNullValue() && Const3->isNullValue() &&
+          Const4->isOne() && Const5->isNullValue()) {
+        clamp = 1;
+      }
+    }
+    else if (User.isMachineOpcode() &&
+             (User.getMachineOpcode() == AMDGPU::V_MUL_F32_e64 ||
+              User.getMachineOpcode() == AMDGPU::V_MUL_F32_e32)) {
+      ConstantSDNode *Const1 = dyn_cast<ConstantSDNode>(User->getOperand(0)); // src0 modifier
+      ConstantSDNode *Const2 = dyn_cast<ConstantSDNode>(User->getOperand(2)); // src1 modifier
+      ConstantFPSDNode *Const3 = dyn_cast<ConstantFPSDNode>(User->getOperand(3)); // src1 value
+      ConstantSDNode *Const4 = dyn_cast<ConstantSDNode>(User->getOperand(4)); // clamp bit
+      ConstantSDNode *Const5 = dyn_cast<ConstantSDNode>(User->getOperand(5)); // omod bit
+      if (Const1 && Const2 && Const3 && Const4 && Const5 &&
+          Const1->isNullValue() && Const2->isNullValue() && Const5->isNullValue()) {
+        if (Const3->isExactlyValue(2.0))
+          mod = SIOutMods::MUL2;
+        else if (Const3->isExactlyValue(4.0))
+          mod = SIOutMods::MUL4;
+        else if (Const3->isExactlyValue(0.5))
+          mod = SIOutMods::DIV2;
+        if (mod != 0 && Const4->isOne())
+          clamp = 1;
+      }
+    }
+  }
+
+  Clamp = CurDAG->getTargetConstant(clamp, SDLoc(Src), MVT::i1);
+  Omod = CurDAG->getTargetConstant(mod, SDLoc(Src), MVT::i32);
+
+  if (clamp != 0 || mod != 0)
+    CurDAG->ReplaceAllUsesWith(ParentUser, Parent);
+
+  return true;
 }
 
-bool AMDGPUDAGToDAGISel::SelectVOP3Mods0Clamp(SDValue In, SDValue &Src,
+bool AMDGPUDAGToDAGISel::SelectVOP3Mods0Clamp(SDNode *Parent, SDValue In, SDValue &Src,
                                               SDValue &SrcMods,
                                               SDValue &Omod) const {
-  // FIXME: Handle Omod
-  Omod = CurDAG->getTargetConstant(0, SDLoc(In), MVT::i32);
+  unsigned mod = SIOutMods::NONE;
 
-  return SelectVOP3Mods(In, Src, SrcMods);
+  SDNode *ParentUser = NULL;
+
+  if (!SelectVOP3Mods(In, Src, SrcMods))
+      return false;
+
+  if (Parent && Parent->hasOneUse()) {
+      ParentUser = *Parent->use_begin();
+  }
+
+  if (ParentUser && ParentUser->getNumValues() == 1) {
+    SDValue User = SDValue(ParentUser, 0);
+    if (User.isMachineOpcode() &&
+        (User.getMachineOpcode() == AMDGPU::V_MUL_F32_e64 ||
+         User.getMachineOpcode() == AMDGPU::V_MUL_F32_e32)) {
+      ConstantSDNode *Const1 = dyn_cast<ConstantSDNode>(User->getOperand(0)); // src0 modifier
+      ConstantSDNode *Const2 = dyn_cast<ConstantSDNode>(User->getOperand(2)); // src1 modifier
+      ConstantFPSDNode *Const3 = dyn_cast<ConstantFPSDNode>(User->getOperand(3)); // src1 is constant 0
+      ConstantSDNode *Const4 = dyn_cast<ConstantSDNode>(User->getOperand(4)); // clamp bit
+      ConstantSDNode *Const5 = dyn_cast<ConstantSDNode>(User->getOperand(5)); // omod bit
+      if (Const1 && Const2 && Const3 && Const4 && Const5 &&
+          Const1->isNullValue() && Const2->isNullValue() && Const3->isZero() &&
+          Const4->isNullValue() && Const5->isNullValue()) {
+        if (Const3->isExactlyValue(2.0))
+          mod = SIOutMods::MUL2;
+        else if (Const3->isExactlyValue(4.0))
+          mod = SIOutMods::MUL4;
+        else if (Const3->isExactlyValue(0.5))
+          mod = SIOutMods::DIV2;
+      }
+    }
+  }
+
+  Omod = CurDAG->getTargetConstant(mod, SDLoc(Src), MVT::i32);
+
+  if (mod != SIOutMods::NONE)
+    CurDAG->ReplaceAllUsesWith(ParentUser, Parent);
+  return true;
 }
 
 bool AMDGPUDAGToDAGISel::SelectVOP3Mods0Clamp0OMod(SDValue In, SDValue &Src,
