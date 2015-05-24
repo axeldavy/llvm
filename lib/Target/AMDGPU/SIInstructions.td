@@ -2139,6 +2139,22 @@ def : Pat <
   (S_BUFFER_LOAD_DWORD_IMM $sbase, (as_dword_i32imm $offset))
 >;
 
+// Two optimisations for gallium nine:
+
+// max(log(x), FP_MIN) -> log_clamp(x). This is not correct if x is INF, but do we care ?
+
+def : Pat <
+  (f32 (fmaxnum (flog2 (VOP3Mods0 f32:$src0, i32:$src0_modifiers, i1:$clamp, i32:$omod)), (f32 FP_F32MIN))),
+  (V_LOG_CLAMP_F32_e64 i32:$src0_modifiers, f32:$src0, i1:$clamp, i32:$omod)
+>;
+
+// min(rsq_clamp(x), FP_MAX) -> rsq_clamp(x)
+
+def : Pat <
+  (f32 (fminnum (AMDGPUrsq_clamped (VOP3Mods0 f32:$src0, i32:$src0_modifiers, i1:$clamp, i32:$omod)), (f32 FP_F32MAX))),
+  (V_RSQ_CLAMP_F32_e64 i32:$src0_modifiers, f32:$src0, i1:$clamp, i32:$omod)
+>;
+
 } // End Predicates = [isSICI]
 
 // 2. Offset loaded in an 32bit SGPR
