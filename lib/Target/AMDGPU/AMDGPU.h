@@ -45,6 +45,7 @@ FunctionPass *createSILowerI1CopiesPass();
 FunctionPass *createSIShrinkInstructionsPass();
 FunctionPass *createSILoadDuplicatePass(TargetMachine &tm);
 FunctionPass *createSILoadStoreOptimizerPass(TargetMachine &tm);
+FunctionPass *createSILoadBufferOptimizerPass(TargetMachine &tm);
 FunctionPass *createSIWholeQuadModePass();
 FunctionPass *createSILowerControlFlowPass();
 FunctionPass *createSIFixControlFlowLiveIntervalsPass();
@@ -74,6 +75,9 @@ extern char &SILoadDuplicateID;
 
 void initializeSILoadStoreOptimizerPass(PassRegistry &);
 extern char &SILoadStoreOptimizerID;
+
+void initializeSILoadBufferOptimizerPass(PassRegistry &);
+extern char &SILoadBufferOptimizerID;
 
 void initializeSIWholeQuadModePass(PassRegistry &);
 extern char &SIWholeQuadModeID;

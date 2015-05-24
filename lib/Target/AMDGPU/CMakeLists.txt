@@ -55,6 +55,7 @@ add_llvm_target(AMDGPUCodeGen
   SIInsertWaits.cpp
   SIInstrInfo.cpp
   SIISelLowering.cpp
+  SILoadBufferOptimizer.cpp
   SILoadDuplicate.cpp
   SILoadStoreOptimizer.cpp
   SILowerControlFlow.cpp
