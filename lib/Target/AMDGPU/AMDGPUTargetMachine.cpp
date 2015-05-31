@@ -21,6 +21,7 @@
 #include "R600MachineScheduler.h"
 #include "SIISelLowering.h"
 #include "SIInstrInfo.h"
+#include "SIMachineScheduler.h"
 #include "llvm/Analysis/Passes.h"
 #include "llvm/CodeGen/MachineFunctionAnalysis.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
@@ -45,6 +46,10 @@ extern "C" void LLVMInitializeAMDGPUTarget() {
 
 static ScheduleDAGInstrs *createR600MachineScheduler(MachineSchedContext *C) {
   return new ScheduleDAGMILive(C, make_unique<R600SchedStrategy>());
+}
+
+static ScheduleDAGInstrs *createSIMachineScheduler(MachineSchedContext *C) {
+  return new ScheduleDAGMILive(C, make_unique<SISchedStrategy>());
 }
 
 static MachineSchedRegistry
@@ -121,6 +126,8 @@ public:
     const AMDGPUSubtarget &ST = *getAMDGPUTargetMachine().getSubtargetImpl();
     if (ST.getGeneration() <= AMDGPUSubtarget::NORTHERN_ISLANDS)
       return createR600MachineScheduler(C);
+    else
+      return createSIMachineScheduler(C);
     return nullptr;
   }
 
