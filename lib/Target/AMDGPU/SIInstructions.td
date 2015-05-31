@@ -2046,6 +2046,20 @@ def : Pat<
                                        DSTCLAMP.NONE, DSTOMOD.NONE))
 >;
 
+def : Pat<
+  (int_AMDGPU_cndlt (fsub FP_ZERO, f32:$src0), f32:$src1, f32:$src2),
+  (V_CNDMASK_B32_e64 $src2, $src1,
+                     (V_CMP_LT_F32_e64 SRCMODS.NONE, 0, SRCMODS.NONE, $src0,
+                                       DSTCLAMP.NONE, DSTOMOD.NONE))
+>;
+
+def : Pat<
+  (int_AMDGPU_cndlt (fsub FP_ZERO, (fabs f32:$src0)), f32:$src1, f32:$src2),
+  (V_CNDMASK_B32_e64 $src2, $src1,
+                     (V_CMP_LG_F32_e64 SRCMODS.NONE, 0, SRCMODS.NONE, $src0,
+                                       DSTCLAMP.NONE, DSTOMOD.NONE))
+>;
+
 def : Pat <
   (int_AMDGPU_kilp),
   (SI_KILL 0xbf800000)
