@@ -49,7 +49,7 @@ static ScheduleDAGInstrs *createR600MachineScheduler(MachineSchedContext *C) {
 }
 
 static ScheduleDAGInstrs *createSIMachineScheduler(MachineSchedContext *C) {
-  return new ScheduleDAGMILive(C, make_unique<SISchedStrategy>());
+  return new SIScheduleDAGMI(C);
 }
 
 static MachineSchedRegistry

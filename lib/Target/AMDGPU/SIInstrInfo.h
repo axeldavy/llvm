@@ -350,6 +350,8 @@ public:
 
   uint64_t getDefaultRsrcDataFormat() const;
 
+  bool isLowLatencyInstruction(const MachineInstr *MI) const;
+  bool isHighLatencyInstruction(const MachineInstr *MI) const;
 };
 
 namespace AMDGPU {
