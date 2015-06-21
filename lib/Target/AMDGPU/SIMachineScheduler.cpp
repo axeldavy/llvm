@@ -219,7 +219,7 @@ SUnit* SIBlockSchedule::pickNode(bool TopOnly, bool &isTop) {
     std::vector<unsigned> MaxPressure = TopRPTracker.getRegSetPressureAtPos();
     TopRPTracker.getDownwardPressure((*I)->getInstr(), pressure, MaxPressure);
     TryCand.SU = *I;
-    TryCand.VGPRUsage = pressure[25];
+    TryCand.VGPRUsage = pressure[26];
     TryCand.isLowLatency = DAG->SITII->isLowLatencyInstruction(TryCand.SU->getInstr());
     tryCandidateTopDown(TopCand, TryCand);
     if (TryCand.Reason != NoCand) {
@@ -239,7 +239,7 @@ SUnit* SIBlockSchedule::pickNode(bool TopOnly, bool &isTop) {
     std::vector<unsigned> MaxPressure = BotRPTracker.getRegSetPressureAtPos();
     BotRPTracker.getUpwardPressure((*I)->getInstr(), pressure, MaxPressure);
     TryCand.SU = *I;
-    TryCand.VGPRUsage = pressure[25];
+    TryCand.VGPRUsage = pressure[26];
     TryCand.isLowLatency = DAG->SITII->isLowLatencyInstruction(TryCand.SU->getInstr());
     tryCandidateBottomUp(BotCand, TryCand);
     if (TryCand.Reason != NoCand) {
@@ -621,8 +621,8 @@ void SIBlockSchedule::printDebug(bool full) {
   }
 
   if (scheduled) {
-    dbgs() << "LiveInPressure " << LiveInPressure[12] << " "<< LiveInPressure[25] << "\n";
-    dbgs() << "LiveOutPressure " << LiveOutPressure[12] << " "<< LiveOutPressure[25] << "\n\n";
+    dbgs() << "LiveInPressure " << LiveInPressure[12] << " "<< LiveInPressure[26] << "\n";
+    dbgs() << "LiveOutPressure " << LiveOutPressure[12] << " "<< LiveOutPressure[26] << "\n\n";
     dbgs() << "LiveIns:\n";
     for (unsigned i = 0, e = LiveInRegs.size(); i != e; ++i) {
       unsigned Reg = LiveInRegs[i];
@@ -666,7 +666,7 @@ SIScheduleDAGMI::SIScheduleDAGMI(MachineSchedContext *C) :
     SGPRsForWaveFronts[i] = SITRI->getNumSGPRsAllowed(ST.getGeneration(), i+1);
     VGPRsForWaveFronts[i] = SITRI->getNumVGPRsAllowed(i+1);
   }
-  VGPRSetID = 25; // TODO: determine dynamically
+  VGPRSetID = 26; // TODO: determine dynamically
   SGPRSetID = 12;
 }
 
