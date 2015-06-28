@@ -684,6 +684,8 @@ void SIScheduleDAGMI::tryCandidate(SIBlockSchedCandidate &Cand,
     return;
   if (tryGreater(TryCand.isHighLatency, Cand.isHighLatency, TryCand, Cand, Latency))
     return;
+  if (tryGreater(TryCand.SuccessorReadiness, Cand.SuccessorReadiness, TryCand, Cand, Latency))
+    return;
   if (tryLess(TryCand.VGPRUsageDiff, Cand.VGPRUsageDiff, TryCand, Cand, RegUsage))
     return;
 }
@@ -709,7 +711,12 @@ SIBlockSchedule *SIScheduleDAGMI::pickBlock() {
   for (std::vector<SIBlockSchedule*>::iterator I = ReadyBlocks.begin(), E = ReadyBlocks.end(); I != E; ++I) {
     SIBlockSchedCandidate TryCand;
     TryCand.Block = *I;
+    
     TryCand.SuccessorReadiness = 0;//TODO
+    for (unsigned j = 0, e = TryCand.Block->Succs.size(); j != e; ++j) {
+      SIBlockSchedule *Succ = TryCand.Block->Succs[j];
+      TryCand.SuccessorReadiness += Succ->isHighLatencyBlock();
+    }
     TryCand.WaveFronts = 0; //TODO
     TryCand.VGPRUsageDiff = checkRegUsageImpact((*I)->getInRegs(), (*I)->getOutRegs())[VGPRSetID];
     TryCand.lastHighLatParentScheduled = TryCand.Block->lastPosHighLatencyParentScheduled;
@@ -1278,6 +1285,78 @@ void SIScheduleDAGMI::createBlocks() {
       Colors[SU->NodeNum] = SUColors[0];
   }
 
+  //TODO: Document
+  /*for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &SUnits[BottomUpIndex2Node[i]];
+    std::vector<unsigned> SUColors;
+
+    // High latency instructions: already given
+    if (Colors[SU->NodeNum] <= maxHighLatencyID && Colors[SU->NodeNum] > 0)
+      continue;
+
+    if (SU->Preds.size() > SU->Succs.size())
+      continue;
+
+    for (SUnit::const_succ_iterator I = SU->Succs.begin(), E = SU->Succs.end();
+         I != E; ++I) {
+      SUnit *Succ = I->getSUnit();
+      if (I->isWeak() || Succ->NodeNum >= DAGSize)
+        continue;
+      SUColors.push_back(Colors[Succ->NodeNum]);
+    }
+    std::sort(SUColors.begin(), SUColors.end()); 
+    SUColors.erase(std::unique(SUColors.begin(), SUColors.end()), SUColors.end());
+    if (SUColors.size() == 0)
+      continue;
+    if (SUColors.size() == 1 && SUColors[0] != Colors[SU->NodeNum]) {
+      maxID++;
+      Colors[SU->NodeNum] = maxID;
+    }
+  }
+
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &SUnits[TopDownIndex2Node[i]];
+    std::vector<unsigned> SUColors;
+
+    // High latency instructions: already given
+    if (Colors[SU->NodeNum] <= maxHighLatencyID && Colors[SU->NodeNum] > 0)
+      continue;
+
+    if (SU->Preds.size() < SU->Succs.size())
+      continue;
+
+    for (SUnit::const_pred_iterator I = SU->Preds.begin(), E = SU->Preds.end();
+         I != E; ++I) {
+      SUnit *Pred = I->getSUnit();
+      if (I->isWeak() || Pred->NodeNum >= DAGSize)
+        continue;
+      SUColors.push_back(Colors[Pred->NodeNum]);
+    }
+    std::sort(SUColors.begin(), SUColors.end()); 
+    SUColors.erase(std::unique(SUColors.begin(), SUColors.end()), SUColors.end());
+    if (SUColors.size() == 0)
+      continue;
+    if (SUColors.size() == 1 && SUColors[0] != Colors[SU->NodeNum]) {
+      maxID++;
+      Colors[SU->NodeNum] = maxID;
+    }
+  }*/
+
+  // To remove blocks:
+  /*for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &SUnits[TopDownIndex2Node[i]];
+    std::vector<unsigned> SUColors;
+
+    // High latency instructions: already given
+    if (Colors[SU->NodeNum] <= maxHighLatencyID && Colors[SU->NodeNum] > 0)
+      continue;
+
+    {
+      maxID++;
+      Colors[SU->NodeNum] = maxID;
+    }
+  }*/
+
   // Put SU of same color into same block
   RealID.resize(maxID+1, -1);
   Node2Block.resize(DAGSize, -1);
@@ -1416,8 +1495,8 @@ void SIScheduleDAGMI::scheduleInsideBlocks() {
 
   // Do not update CurrentTop
   MachineBasicBlock::iterator CurrentTopFastSched = CurrentTop;
-  std::vector<int> PosOld;
-  std::vector<int> PosNew;
+  std::vector<MachineBasicBlock::iterator> PosOld;
+  std::vector<MachineBasicBlock::iterator> PosNew;
   PosOld.reserve(SUnits.size());
   PosNew.reserve(SUnits.size());
 
@@ -1429,9 +1508,9 @@ void SIScheduleDAGMI::scheduleInsideBlocks() {
     for (unsigned j = 0, ej = SUs.size(); j != ej; ++j) {
       MachineInstr *MI = SUs[j]->getInstr();
       MachineBasicBlock::iterator Pos = MI;
-      PosOld.push_back(Pos-CurrentTop);
+      PosOld.push_back(Pos);
       if (&*CurrentTopFastSched == MI) {
-        PosNew.push_back(Pos-CurrentTop);
+        PosNew.push_back(Pos);
         CurrentTopFastSched = nextIfDebug(++CurrentTopFastSched, CurrentBottom);
       } else {
         // Update the instruction stream.
@@ -1439,7 +1518,7 @@ void SIScheduleDAGMI::scheduleInsideBlocks() {
 
         // Update LiveIntervals
         LIS->handleMove(MI, /*UpdateFlags=*/true);
-        PosNew.push_back(CurrentTopFastSched-CurrentTop);
+        PosNew.push_back(CurrentTopFastSched); dbgs() << CurrentTopFastSched-CurrentTop << "\n";
       }
     }
     Block->fillMIBoundaries(SUs[0]->getInstr(), SUs[SUs.size()-1]->getInstr());
@@ -1454,8 +1533,8 @@ void SIScheduleDAGMI::scheduleInsideBlocks() {
   DEBUG(dbgs() << "Restoring MI Pos\n");
   // Restore old ordering (which guarantees LIS->handleMove to be happy)
   for (unsigned i = PosOld.size(), e = 0; i != e; --i) {
-    MachineBasicBlock::iterator POld = CurrentTop + PosOld[i-1];
-    MachineBasicBlock::iterator PNew = CurrentTop + PosNew[i-1];
+    MachineBasicBlock::iterator POld = PosOld[i-1];
+    MachineBasicBlock::iterator PNew = PosNew[i-1];
     if (PNew != POld) {
       // Update the instruction stream.
       BB->splice(POld, BB, PNew);
