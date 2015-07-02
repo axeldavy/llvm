@@ -129,21 +129,6 @@ static bool tryGreater(int TryVal, int CandVal,
 
 // SIBlockSchedule //
 
-SIBlockSchedule::SIBlockSchedule(SIScheduleDAGMI *dag, unsigned ID, bool isHighLatencyBlock) :
-  DAG(dag), TopRPTracker(TopPressure),
-  BotRPTracker(BotPressure), RPTracker(Pressure),
-  scheduled(false), highLatencyBlock(isHighLatencyBlock), BlockBeginEndFilled(false), ID(ID),
-  lastPosHighLatencyParentScheduled(0) {
-  SUnits.clear();
-  TopReadySUs.clear();
-  BottomReadySUs.clear();
-  ScheduledSUnits.clear();
-  Preds.clear();
-  Succs.clear();
-  NumPredsLeft = 0;
-  NumSuccsLeft = 0;
-}
-
 void SIBlockSchedule::addUnit(SUnit *SU) {
   SUnits.push_back(SU);
 }
@@ -294,13 +279,15 @@ static bool findDefBetween(unsigned Reg,
   return false;
 }
 
-void SIBlockSchedule::initRegPressure() {
+void SIBlockSchedule::initRegPressure(MachineBasicBlock::iterator BeginBlock, MachineBasicBlock::iterator EndBlock) {
   LiveIntervals *LIS = DAG->getLIS();
   MachineRegisterInfo *MRI = DAG->getMRI();
   DAG->initRPTracker(TopRPTracker);
   DAG->initRPTracker(BotRPTracker);
   DAG->initRPTracker(RPTracker);
 
+  // Goes though all SU. RPTracker captures what had to be alive for the SUs
+  // to execute, and what is still alive at the end
   for (unsigned i = 0, e = (unsigned)ScheduledSUnits.size(); i != e; ++i) {
     SUnit *SU = ScheduledSUnits[i];
     RPTracker.setPos(SU->getInstr());
@@ -353,21 +340,17 @@ void SIBlockSchedule::initRegPressure() {
   // This converts currently live regs into live ins/outs.
   TopRPTracker.closeTop();
   BotRPTracker.closeBottom();
-
-  undoSchedule();
 }
 
-void SIBlockSchedule::schedule() {
+void SIBlockSchedule::schedule(MachineBasicBlock::iterator BeginBlock, MachineBasicBlock::iterator EndBlock) {
   std::vector<SUnit*> LowLatencyReadySUs;
   std::vector<SUnit*> ScheduledSUnitsBottom;
-
-  assert(BlockBeginEndFilled);
 
   if (!scheduled)
     fastSchedule();
 
   // PreScheduling phase to discover LiveIn and LiveOut
-  initRegPressure();
+  initRegPressure(BeginBlock, EndBlock);
   undoSchedule();
 
   // Schedule for real now
@@ -673,260 +656,9 @@ SIScheduleDAGMI::SIScheduleDAGMI(MachineSchedContext *C) :
 SIScheduleDAGMI::~SIScheduleDAGMI() {
 }
 
-void SIScheduleDAGMI::tryCandidate(SIBlockSchedCandidate &Cand,
-                                   SIBlockSchedCandidate &TryCand) {
-  if (!Cand.isValid()) {
-    TryCand.Reason = NodeOrder;
-    return;
-  }
-
-  if (tryLess(TryCand.lastHighLatParentScheduled, Cand.lastHighLatParentScheduled, TryCand, Cand, Latency))
-    return;
-  if (tryGreater(TryCand.isHighLatency, Cand.isHighLatency, TryCand, Cand, Latency))
-    return;
-  if (tryGreater(TryCand.SuccessorReadiness, Cand.SuccessorReadiness, TryCand, Cand, Latency))
-    return;
-  if (tryLess(TryCand.VGPRUsageDiff, Cand.VGPRUsageDiff, TryCand, Cand, RegUsage))
-    return;
-}
-
-SIBlockSchedule *SIScheduleDAGMI::pickBlock() {
-  SIBlockSchedCandidate Cand;
-  std::vector<SIBlockSchedule*>::iterator Best;
-  SIBlockSchedule *Block;
-  if (ReadyBlocks.size() == 0)
-    return nullptr;
-
-  DEBUG(
-    dbgs() << "Picking New Blocks\n";
-    dbgs() << "Available: ";
-    for (std::vector<SIBlockSchedule*>::iterator I = ReadyBlocks.begin(), E = ReadyBlocks.end(); I != E; ++I)
-      dbgs() << (*I)->ID << " ";
-    dbgs() << "\nCurrent Live:\n";
-    for (std::set<unsigned>::iterator I = LiveRegs.begin(), e = LiveRegs.end(); I != e; I++)
-      dbgs() << PrintVRegOrUnit(*I, TRI) << " ";
-    dbgs() << "\n";
-  );
-
-  for (std::vector<SIBlockSchedule*>::iterator I = ReadyBlocks.begin(), E = ReadyBlocks.end(); I != E; ++I) {
-    SIBlockSchedCandidate TryCand;
-    TryCand.Block = *I;
-    
-    TryCand.SuccessorReadiness = 0;//TODO
-    for (unsigned j = 0, e = TryCand.Block->Succs.size(); j != e; ++j) {
-      SIBlockSchedule *Succ = TryCand.Block->Succs[j];
-      TryCand.SuccessorReadiness += Succ->isHighLatencyBlock();
-    }
-    TryCand.WaveFronts = 0; //TODO
-    TryCand.VGPRUsageDiff = checkRegUsageImpact((*I)->getInRegs(), (*I)->getOutRegs())[VGPRSetID];
-    TryCand.lastHighLatParentScheduled = TryCand.Block->lastPosHighLatencyParentScheduled;
-    TryCand.isHighLatency = TryCand.Block->isHighLatencyBlock();
-    tryCandidate(Cand, TryCand);
-    if (TryCand.Reason != NoCand) {
-      Cand.setBest(TryCand);
-      Best = I;
-      DEBUG(dbgs() << "Best Current Choice: " << Cand.Block->ID << " " << getReasonStr(Cand.Reason) << "\n");
-    }
-  }
-
-  DEBUG(
-    dbgs() << "Picking: " << Cand.Block->ID << "\n";
-    if (Cand.isHighLatency)
-      dbgs() << "Is a block with high latency instruction\n";
-    dbgs() << "Position of last high latency dependency: " << Cand.lastHighLatParentScheduled << "\n";
-    dbgs() << "VGPRUsageDiff: " << Cand.VGPRUsageDiff << "\n";
-    dbgs() << "\n";
-  );
-
-  Block = Cand.Block;
-  ReadyBlocks.erase(Best);
-  return Block;
-}
-
-void SIScheduleDAGMI::releaseBlockSuccs(SIBlockSchedule *Parent) {
-  for (unsigned i = 0, e = Parent->Succs.size(); i != e; ++i) {
-    SIBlockSchedule *Block = Blocks[Parent->Succs[i]->ID].get();
-    Block->NumPredsLeft--;
-    if (Block->NumPredsLeft == 0) {
-      ReadyBlocks.push_back(Block);
-    }
-    if (Parent->isHighLatencyBlock())
-      Block->lastPosHighLatencyParentScheduled = numBlockScheduled;
-  }
-}
-
-void SIScheduleDAGMI::addLiveRegs(ArrayRef<unsigned> Regs) {
-  for (unsigned I = 0, E = Regs.size(); I != E; ++I) {
-    // For now only track virtual registers
-    if (!TargetRegisterInfo::isVirtualRegister(Regs[I]))
-      continue;
-    // if not already in the live set, then add it
-    (void) LiveRegs.insert(Regs[I]);
-  }
-}
-
-void SIScheduleDAGMI::decreaseLiveRegs(ArrayRef<unsigned> Regs) {
-  for (unsigned I = 0, E = Regs.size(); I != E; ++I) {
-    // For now only track virtual registers
-    std::set<unsigned>::iterator Pos = LiveRegs.find(Regs[I]);
-    assert (Pos != LiveRegs.end()); // Reg must be live
-    assert (LiveRegsConsumers.find(Regs[I]) != LiveRegsConsumers.end());
-    assert (LiveRegsConsumers[Regs[I]] >= 1);
-    --LiveRegsConsumers[Regs[I]];
-    if (LiveRegsConsumers[Regs[I]] == 0) {
-      LiveRegs.erase(Pos);
-    }
-  }
-}
-
-void SIScheduleDAGMI::blockScheduled(SIBlockSchedule *Block) {
-  numBlockScheduled++;
-  //addLiveRegs(Block->getInRegs()); // shouldn't be needed. TODO: find where is the bug
-  decreaseLiveRegs(Block->getInRegs());
-  addLiveRegs(Block->getOutRegs());
-  releaseBlockSuccs(Block);
-  ArrayRef<unsigned> Regs = Block->getOutRegs();
-  for (unsigned I = 0, E = Regs.size(); I != E; ++I) {
-    if (LiveRegsConsumers.find(Regs[I]) == LiveRegsConsumers.end())
-      LiveRegsConsumers[Regs[I]] = Block->LiveOutRegsNumUsages[I]; // Add element
-    else
-      LiveRegsConsumers[Regs[I]] += Block->LiveOutRegsNumUsages[I];
-  }
-}
-
-std::vector<int> SIScheduleDAGMI::checkRegUsageImpact(ArrayRef<unsigned> InRegs,
-                                                      ArrayRef<unsigned> OutRegs) {
-  std::vector<int> DiffSetPressure;
-  DiffSetPressure.assign(TRI->getNumRegPressureSets(), 0);
-
-  for (unsigned i = 0, e = InRegs.size(); i != e; ++i) {
-    // For now only track virtual registers
-    if (!TargetRegisterInfo::isVirtualRegister(InRegs[i]))
-      continue;
-    if (LiveRegsConsumers[InRegs[i]] > 1)
-      continue;
-    PSetIterator PSetI = MRI.getPressureSets(InRegs[i]);
-    for (; PSetI.isValid(); ++PSetI) {
-      DiffSetPressure[*PSetI] -= PSetI.getWeight();
-    }
-  }
-
-  for (unsigned i = 0, e = OutRegs.size(); i != e; ++i) {
-    // For now only track virtual registers
-    if (!TargetRegisterInfo::isVirtualRegister(OutRegs[i]))
-      continue;
-    PSetIterator PSetI = MRI.getPressureSets(OutRegs[i]);
-    for (; PSetI.isValid(); ++PSetI) {
-      DiffSetPressure[*PSetI] += PSetI.getWeight();
-    }
-  }
-
-  return DiffSetPressure;
-}
-
-void SIScheduleDAGMI::moveLowLatencies() {
-   unsigned DAGSize = SUnits.size();
-   int last_low_latency_user = -1;
-   int last_low_latency_pos = -1;
-  // TODO: form groups
-  // Move low latencies sooner
-   for (unsigned i = 0, e = ScheduledSUnits.size(); i != e; ++i) {
-    SUnit *SU = &SUnits[ScheduledSUnits[i]];
-    unsigned MinPos = 0;
-
-    for (SUnit::const_pred_iterator I = SU->Preds.begin(), E = SU->Preds.end();
-         I != E; ++I) {
-      SUnit *Pred = I->getSUnit();
-      if (SITII->isLowLatencyInstruction(Pred->getInstr())) {
-        last_low_latency_user = i;
-      }
-      if (Pred->NodeNum >= DAGSize)
-        continue;
-      unsigned PredPos = ScheduledSUnitsInv[Pred->NodeNum];
-      if (PredPos >= MinPos)
-        MinPos = PredPos + 1;
-    }
-
-    if (SITII->isLowLatencyInstruction(SU->getInstr())) {
-      unsigned BestPos = last_low_latency_user + 1;
-      if (BestPos > i) // instruction is user of low latency too
-        BestPos = i;
-      if ((int)BestPos <= last_low_latency_pos)
-        BestPos = last_low_latency_pos + 1;
-      if (BestPos < MinPos)
-        BestPos = MinPos;
-      if (BestPos < i) {
-        for (unsigned u = i; u > BestPos; --u) {
-          ++ScheduledSUnitsInv[ScheduledSUnits[u-1]];
-          ScheduledSUnits[u] = ScheduledSUnits[u-1];
-        }
-        ScheduledSUnits[BestPos] = SU->NodeNum;
-        ScheduledSUnitsInv[SU->NodeNum] = BestPos;
-      }
-      last_low_latency_pos = BestPos;
-    }
-  }
-}
-
-void SIScheduleDAGMI::schedule()
-{
-  LiveRegs.clear();
-  LiveRegsConsumers.clear();
-
-  prepareSchedule();
-
-  ScheduledSUnits.clear();
-  ScheduledSUnitsInv.resize(SUnits.size()); // do only now as SUnits wasn't filled before
-
-  assert(TopRPTracker.getPos() == RegionBegin && "bad initial Top tracker");
-  TopRPTracker.setPos(CurrentTop);
-
-  numBlockScheduled = 0;
-
-  while (SIBlockSchedule *Block = pickBlock()) {
-    std::vector<SUnit*> SUs = Block->getScheduledUnits();
-
-    for (unsigned i = 0, e = SUs.size(); i != e; ++i) {
-      ScheduledSUnitsInv[SUs[i]->NodeNum] = ScheduledSUnits.size();
-      ScheduledSUnits.push_back(SUs[i]->NodeNum);
-    }
-
-    blockScheduled(Block);
-  }
-
-  moveLowLatencies();
-
-  for (unsigned i = 0, e = ScheduledSUnits.size(); i != e; ++i) {
-    SUnit *SU = &SUnits[ScheduledSUnits[i]];
-
-    scheduleMI(SU, true);
-
-    DEBUG(dbgs() << "Scheduling SU(" << SU->NodeNum << ") " << *SU->getInstr());
-  }
-
-  assert(CurrentTop == CurrentBottom && "Nonempty unscheduled zone.");
-
-  placeDebugValues();
-
-  DEBUG({
-      unsigned BBNum = begin()->getParent()->getNumber();
-      dbgs() << "*** Final schedule for BB#" << BBNum << " ***\n";
-      dumpSchedule();
-      dbgs() << '\n';
-    });
-
-  Blocks.clear();
-  TopDownIndex2Node.clear();
-  TopDownNode2Index.clear();
-  BottomUpIndex2Node.clear();
-  BottomUpNode2Index.clear();
-  Node2Block.clear();
-}
-
 void SIScheduleDAGMI::prepareSchedule() {
   DEBUG(dbgs() << "Preparing Scheduling\n");
   buildDAGWithRegPressure();
-  addLiveRegs(RPTracker.getPressure().LiveInRegs);
   DEBUG(for (unsigned su = 0, e = SUnits.size(); su != e; ++su)
         SUnits[su].dumpAll(this));
   topologicalSort();
@@ -936,12 +668,6 @@ void SIScheduleDAGMI::prepareSchedule() {
   initQueues(TopRoots, BotRoots);
   createBlocks();
   scheduleInsideBlocks();
-  for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
-    SIBlockSchedule *Block = Blocks[i].get();
-    if (Block->NumPredsLeft == 0) {
-      ReadyBlocks.push_back(Block);
-    }
-  }
 }
 
 // see scheduleDAG
@@ -1518,16 +1244,16 @@ void SIScheduleDAGMI::scheduleInsideBlocks() {
 
         // Update LiveIntervals
         LIS->handleMove(MI, /*UpdateFlags=*/true);
-        PosNew.push_back(CurrentTopFastSched); dbgs() << CurrentTopFastSched-CurrentTop << "\n";
+        PosNew.push_back(CurrentTopFastSched);
       }
     }
-    Block->fillMIBoundaries(SUs[0]->getInstr(), SUs[SUs.size()-1]->getInstr());
   }
 
-  // Now we have Block == Block of MI
+  // Now we have Block of SUs == Block of MI
   for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
     SIBlockSchedule *Block = Blocks[i].get();
-    Block->schedule();
+    std::vector<SUnit*> SUs = Block->getScheduledUnits();
+    Block->schedule(SUs[0]->getInstr(), SUs[SUs.size()-1]->getInstr());
   }
 
   DEBUG(dbgs() << "Restoring MI Pos\n");
@@ -1553,6 +1279,125 @@ void SIScheduleDAGMI::scheduleInsideBlocks() {
     SIBlockSchedule *Block = Blocks[i].get();
     for (unsigned j = 0, ej = Block->getInRegs().size(); j != ej; ++j) {
       unsigned Reg = Block->getInRegs()[j];
+      for (unsigned k = 0, e = Block->Preds.size(); k != e; ++k) {
+        SIBlockSchedule *Pred = Block->Preds[k];
+        ArrayRef<unsigned> PredOutRegs = Pred->getOutRegs();
+        ArrayRef<unsigned>::iterator RegPos = std::find(PredOutRegs.begin(), PredOutRegs.end(), Reg);
+        if (RegPos != PredOutRegs.end()) {
+          ++Pred->LiveOutRegsNumUsages[RegPos - PredOutRegs.begin()];
+          break;
+        }
+      }
+    }
+  }
+
+  DEBUG(
+    for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
+      SIBlockSchedule *Block = Blocks[i].get();
+      Block->printDebug(true);
+    }
+  );
+}
+
+void SIScheduleDAGMI::moveLowLatencies() {
+   unsigned DAGSize = SUnits.size();
+   int last_low_latency_user = -1;
+   int last_low_latency_pos = -1;
+  // TODO: form groups
+  // Move low latencies sooner
+   for (unsigned i = 0, e = ScheduledSUnits.size(); i != e; ++i) {
+    SUnit *SU = &SUnits[ScheduledSUnits[i]];
+    unsigned MinPos = 0;
+
+    for (SUnit::const_pred_iterator I = SU->Preds.begin(), E = SU->Preds.end();
+         I != E; ++I) {
+      SUnit *Pred = I->getSUnit();
+      if (SITII->isLowLatencyInstruction(Pred->getInstr())) {
+        last_low_latency_user = i;
+      }
+      if (Pred->NodeNum >= DAGSize)
+        continue;
+      unsigned PredPos = ScheduledSUnitsInv[Pred->NodeNum];
+      if (PredPos >= MinPos)
+        MinPos = PredPos + 1;
+    }
+
+    if (SITII->isLowLatencyInstruction(SU->getInstr())) {
+      unsigned BestPos = last_low_latency_user + 1;
+      if (BestPos > i) // instruction is user of low latency too
+        BestPos = i;
+      if ((int)BestPos <= last_low_latency_pos)
+        BestPos = last_low_latency_pos + 1;
+      if (BestPos < MinPos)
+        BestPos = MinPos;
+      if (BestPos < i) {
+        for (unsigned u = i; u > BestPos; --u) {
+          ++ScheduledSUnitsInv[ScheduledSUnits[u-1]];
+          ScheduledSUnits[u] = ScheduledSUnits[u-1];
+        }
+        ScheduledSUnits[BestPos] = SU->NodeNum;
+        ScheduledSUnitsInv[SU->NodeNum] = BestPos;
+      }
+      last_low_latency_pos = BestPos;
+    }
+  }
+}
+
+std::vector<int> SIScheduleDAGMI::checkRegUsageImpact(ArrayRef<unsigned> InRegs,
+                                                      ArrayRef<unsigned> OutRegs) {
+  std::vector<int> DiffSetPressure;
+  DiffSetPressure.assign(TRI->getNumRegPressureSets(), 0);
+
+  for (unsigned i = 0, e = InRegs.size(); i != e; ++i) {
+    // For now only track virtual registers
+    if (!TargetRegisterInfo::isVirtualRegister(InRegs[i]))
+      continue;
+    if (LiveRegsConsumers[InRegs[i]] > 1)
+      continue;
+    PSetIterator PSetI = MRI.getPressureSets(InRegs[i]);
+    for (; PSetI.isValid(); ++PSetI) {
+      DiffSetPressure[*PSetI] -= PSetI.getWeight();
+    }
+  }
+
+  for (unsigned i = 0, e = OutRegs.size(); i != e; ++i) {
+    // For now only track virtual registers
+    if (!TargetRegisterInfo::isVirtualRegister(OutRegs[i]))
+      continue;
+    PSetIterator PSetI = MRI.getPressureSets(OutRegs[i]);
+    for (; PSetI.isValid(); ++PSetI) {
+      DiffSetPressure[*PSetI] += PSetI.getWeight();
+    }
+  }
+
+  return DiffSetPressure;
+}
+
+void SIScheduleDAGMI::prepareScheduleVariant() {
+  LiveRegs.clear();
+  LiveRegsConsumers.clear();
+  numBlockScheduled = 0;
+  ReadyBlocks.clear();
+  VGPRSUsedAfterBlock.clear();
+  BlockScheduleOrder.clear();
+  BlockScheduleOrder.reserve(Blocks.size());
+  VGPRSUsedAfterBlock.reserve(Blocks.size());
+
+  for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
+    SIBlockSchedule *Block = Blocks[i].get();
+    Block->NumPredsLeft = Block->Preds.size();
+    Block->NumSuccsLeft = Block->Succs.size();
+    Block->firstPosUserScheduled = 0;
+    Block->lastPosHighLatencyParentScheduled = 0;
+  }
+
+  addLiveRegs(RPTracker.getPressure().LiveInRegs);
+
+  // fill LiveRegsConsumers for regs that were already defined before scheduling
+  for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
+    SIBlockSchedule *Block = Blocks[i].get();
+    for (unsigned j = 0, ej = Block->getInRegs().size(); j != ej; ++j) {
+      unsigned Reg = Block->getInRegs()[j];
       bool found = false;
       for (unsigned k = 0, e = Block->Preds.size(); k != e; ++k) {
         SIBlockSchedule *Pred = Block->Preds[k];
@@ -1560,10 +1405,10 @@ void SIScheduleDAGMI::scheduleInsideBlocks() {
         ArrayRef<unsigned>::iterator RegPos = std::find(PredOutRegs.begin(), PredOutRegs.end(), Reg);
         if (RegPos != PredOutRegs.end()) {
           found = true;
-          ++Pred->LiveOutRegsNumUsages[RegPos - PredOutRegs.begin()];
           break;
         }
       }
+      
       if (!found) {
         if (LiveRegsConsumers.find(Reg) == LiveRegsConsumers.end())
           LiveRegsConsumers[Reg] = 1; // Add element
@@ -1575,8 +1420,116 @@ void SIScheduleDAGMI::scheduleInsideBlocks() {
 
   for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
     SIBlockSchedule *Block = Blocks[i].get();
-    DEBUG(Block->printDebug(true));
+    if (Block->NumPredsLeft == 0) {
+      ReadyBlocks.push_back(Block);
+    }
   }
+}
+
+void SIScheduleDAGMI::addLiveRegs(ArrayRef<unsigned> Regs) {
+  for (unsigned I = 0, E = Regs.size(); I != E; ++I) {
+    // For now only track virtual registers
+    if (!TargetRegisterInfo::isVirtualRegister(Regs[I]))
+      continue;
+    // if not already in the live set, then add it
+    (void) LiveRegs.insert(Regs[I]);
+  }
+}
+
+void SIScheduleDAGMI::decreaseLiveRegs(ArrayRef<unsigned> Regs) {
+  for (unsigned I = 0, E = Regs.size(); I != E; ++I) {
+    // For now only track virtual registers
+    std::set<unsigned>::iterator Pos = LiveRegs.find(Regs[I]);
+    assert (Pos != LiveRegs.end()); // Reg must be live
+    assert (LiveRegsConsumers.find(Regs[I]) != LiveRegsConsumers.end());
+    assert (LiveRegsConsumers[Regs[I]] >= 1);
+    --LiveRegsConsumers[Regs[I]];
+    if (LiveRegsConsumers[Regs[I]] == 0) {
+      LiveRegs.erase(Pos);
+    }
+  }
+}
+
+void SIScheduleDAGMI::releaseBlockSuccs(SIBlockSchedule *Parent) {
+  for (unsigned i = 0, e = Parent->Succs.size(); i != e; ++i) {
+    SIBlockSchedule *Block = Blocks[Parent->Succs[i]->ID].get();
+    Block->NumPredsLeft--;
+    if (Block->NumPredsLeft == 0) {
+      ReadyBlocks.push_back(Block);
+    }
+    if (Parent->isHighLatencyBlock())
+      Block->lastPosHighLatencyParentScheduled = numBlockScheduled;
+  }
+}
+
+void SIScheduleDAGMI::blockScheduled(SIBlockSchedule *Block) {
+  if (numBlockScheduled == 0)
+    VGPRSUsedAfterBlock[numBlockScheduled] = checkRegUsageImpact(llvm::ArrayRef<unsigned> (), RPTracker.getPressure().LiveInRegs)[VGPRSetID];
+  else
+    VGPRSUsedAfterBlock[numBlockScheduled] = VGPRSUsedAfterBlock[numBlockScheduled-1];
+  VGPRSUsedAfterBlock[numBlockScheduled] += checkRegUsageImpact(Block->getInRegs(), Block->getOutRegs())[VGPRSetID];
+  DEBUG(dbgs() << " ***** " << VGPRSUsedAfterBlock[numBlockScheduled] << " *** ");
+  assert (VGPRSUsedAfterBlock[numBlockScheduled] <= __INT_MAX__); // check never gets below 0 if signed
+
+  decreaseLiveRegs(Block->getInRegs());
+  addLiveRegs(Block->getOutRegs());
+  releaseBlockSuccs(Block);
+  ArrayRef<unsigned> Regs = Block->getOutRegs();
+  for (unsigned I = 0, E = Regs.size(); I != E; ++I) {
+    if (LiveRegsConsumers.find(Regs[I]) == LiveRegsConsumers.end())
+      LiveRegsConsumers[Regs[I]] = Block->LiveOutRegsNumUsages[I]; // Add element
+    else
+      LiveRegsConsumers[Regs[I]] += Block->LiveOutRegsNumUsages[I];
+  }
+  for (unsigned i = 0, e = Block->Preds.size(); i != e; ++i) {
+    SIBlockSchedule *Parent = Blocks[Block->Preds[i]->ID].get();
+    if (Parent->firstPosUserScheduled == 0)
+      Parent->firstPosUserScheduled = numBlockScheduled;
+  }
+  numBlockScheduled++;
+}
+
+float SIScheduleDAGMI::getSchedulingScore()
+{
+  std::vector<unsigned> sumBlockCosts;
+  unsigned minCostLatencyHiding = SUnits.size();
+  unsigned meanCostLatencyHiding = 0;
+  unsigned numHighLatInstructions = 0;
+  unsigned numWavefronts;
+  unsigned maxVGPRUsage = 0;
+
+  sumBlockCosts.reserve(Blocks.size());
+
+  for (unsigned b = 0; b < Blocks.size(); b++) {
+    SIBlockSchedule *Block = Blocks[BlockScheduleOrder[b]].get();
+    if (b == 0)
+      sumBlockCosts[b] = Block->getCost();
+    else
+      sumBlockCosts[b] = sumBlockCosts[b-1] + Block->getCost();
+    if (VGPRSUsedAfterBlock[b] > maxVGPRUsage)
+      maxVGPRUsage = VGPRSUsedAfterBlock[b];
+  }
+
+  for (unsigned b = 0; b < Blocks.size(); b++) {
+    unsigned HidingCost;
+    SIBlockSchedule *Block = Blocks[BlockScheduleOrder[b]].get();
+    if (Block->isHighLatencyBlock() && Block->firstPosUserScheduled > b) {
+      HidingCost = sumBlockCosts[Block->firstPosUserScheduled] - sumBlockCosts[b + 1];
+      numHighLatInstructions++;
+      if (HidingCost < minCostLatencyHiding)
+        minCostLatencyHiding = HidingCost;
+      meanCostLatencyHiding += HidingCost;
+    }
+  }
+
+  if (numHighLatInstructions)
+    meanCostLatencyHiding /= numHighLatInstructions;
+
+  numWavefronts = getWaveFrontsForUsage(0, maxVGPRUsage);
+  DEBUG(dbgs() << "(determined Wavefront Count: " << numWavefronts << ") " << maxVGPRUsage << " " << meanCostLatencyHiding << " " << minCostLatencyHiding << " ");
+  
+
+  return (meanCostLatencyHiding + minCostLatencyHiding) * numWavefronts;
 }
 
 unsigned SIScheduleDAGMI::getWaveFrontsForUsage(unsigned SGPRsUsed,
@@ -1589,47 +1542,187 @@ unsigned SIScheduleDAGMI::getWaveFrontsForUsage(unsigned SGPRsUsed,
       break;
   }
 
-  if (i+1 < CurrentWaveFronts)
-    return i+1;
-  return CurrentWaveFronts;
+  return i+1;
 }
-/*
-SUnit* SISchedStrategy::pickNode(bool &IsTopNode) {
-  ReadyQueue &Q = Available;
-  SISchedCandidate Cand;
-  SUnit *SU;
 
-  DEBUG(Q.dump());
-
-  if (DAG->top() == DAG->bottom()) {
-    assert(Available.empty() && "ReadyQ garbage");
-    return nullptr;
+void SIScheduleDAGMI::tryCandidate(SIBlockSchedCandidate &Cand,
+                                   SIBlockSchedCandidate &TryCand) {
+  if (!Cand.isValid()) {
+    TryCand.Reason = NodeOrder;
+    return;
   }
 
-  do {
-    for (ReadyQueue::iterator I = Q.begin(), E = Q.end(); I != E; ++I) {
-      SISchedCandidate TryCand;
-      TryCand.SU = *I;
-      TryCand.SuccessorReadiness = computeSuccessorReadiness(TryCand.SU );
-      TryCand.WaveFronts = getWaveFrontsAfterInstruction(TryCand.SU);
-      tryCandidate(Cand, TryCand);
-      if (TryCand.Reason != NoCand) {
-          Cand.setBest(TryCand);
-          DEBUG(traceCandidate(Cand));
-      }
-    }
-    SU = Cand.SU;
-
-    if (!SU)
-      SU = *Available.begin();
-    IsTopNode = true;
-  } while (SU->isScheduled);
-
-  Available.remove(Available.find(SU));
-
-  DEBUG(dbgs() << "Scheduling SU(" << SU->NodeNum << ") " << *SU->getInstr());
-  DEBUG(dbgs() << "Estimated next WaveFronts: " << getWaveFrontsAfterInstruction(SU) << "\n");
-  DEBUG(dbgs() << "Ready Successor score: " << computeSuccessorReadiness(SU) << "\n");
-  return SU;
+  if (currentVariant == ReguseLatencyTopDown)
+    if (tryLess(TryCand.VGPRUsageDiff, Cand.VGPRUsageDiff, TryCand, Cand, RegUsage))
+      return;
+  if (tryLess(TryCand.lastHighLatParentScheduled, Cand.lastHighLatParentScheduled, TryCand, Cand, Latency))
+    return;
+  if (tryGreater(TryCand.isHighLatency, Cand.isHighLatency, TryCand, Cand, Latency))
+    return;
+  if (tryGreater(TryCand.SuccessorReadiness, Cand.SuccessorReadiness, TryCand, Cand, Latency))
+    return;
+  if (currentVariant == LatencyReguseTopDown)
+    if (tryLess(TryCand.VGPRUsageDiff, Cand.VGPRUsageDiff, TryCand, Cand, RegUsage))
+      return;
 }
-*/
+
+SIBlockSchedule *SIScheduleDAGMI::pickBlock() {
+  SIBlockSchedCandidate Cand;
+  std::vector<SIBlockSchedule*>::iterator Best;
+  SIBlockSchedule *Block;
+  if (ReadyBlocks.size() == 0)
+    return nullptr;
+
+  DEBUG(
+    dbgs() << "Picking New Blocks\n";
+    dbgs() << "Available: ";
+    for (std::vector<SIBlockSchedule*>::iterator I = ReadyBlocks.begin(), E = ReadyBlocks.end(); I != E; ++I)
+      dbgs() << (*I)->ID << " ";
+    dbgs() << "\nCurrent Live:\n";
+    for (std::set<unsigned>::iterator I = LiveRegs.begin(), e = LiveRegs.end(); I != e; I++)
+      dbgs() << PrintVRegOrUnit(*I, TRI) << " ";
+    dbgs() << "\n";
+  );
+
+  for (std::vector<SIBlockSchedule*>::iterator I = ReadyBlocks.begin(), E = ReadyBlocks.end(); I != E; ++I) {
+    SIBlockSchedCandidate TryCand;
+    TryCand.Block = *I;
+    
+    TryCand.SuccessorReadiness = 0;//TODO
+    for (unsigned j = 0, e = TryCand.Block->Succs.size(); j != e; ++j) {
+      SIBlockSchedule *Succ = TryCand.Block->Succs[j];
+      TryCand.SuccessorReadiness += Succ->isHighLatencyBlock();
+    }
+    TryCand.WaveFronts = 0; //TODO
+    TryCand.VGPRUsageDiff = checkRegUsageImpact((*I)->getInRegs(), (*I)->getOutRegs())[VGPRSetID];
+    TryCand.lastHighLatParentScheduled = TryCand.Block->lastPosHighLatencyParentScheduled;
+    TryCand.isHighLatency = TryCand.Block->isHighLatencyBlock();
+    tryCandidate(Cand, TryCand);
+    if (TryCand.Reason != NoCand) {
+      Cand.setBest(TryCand);
+      Best = I;
+      DEBUG(dbgs() << "Best Current Choice: " << Cand.Block->ID << " " << getReasonStr(Cand.Reason) << "\n");
+    }
+  }
+
+  DEBUG(
+    dbgs() << "Picking: " << Cand.Block->ID << "\n";
+    if (Cand.isHighLatency)
+      dbgs() << "Is a block with high latency instruction\n";
+    dbgs() << "Position of last high latency dependency: " << Cand.lastHighLatParentScheduled << "\n";
+    dbgs() << "VGPRUsageDiff: " << Cand.VGPRUsageDiff << "\n";
+    dbgs() << "\n";
+  );
+
+  Block = Cand.Block;
+  ReadyBlocks.erase(Best);
+  return Block;
+}
+
+const char *SIScheduleDAGMI::getVariantStr(SIScheduleVariant variant)
+{
+  switch (variant) {
+  case LatencyOnlyTopDown:              return "LatencyOnlyTopDown";
+  case LatencyReguseTopDown:            return "LatencyReguseTopDown";
+  case ReguseLatencyTopDown:            return "ReguseLatencyTopDown";
+  case LatencyOnlyBottomUp:             return "LatencyOnlyBottomUp";
+  case LatencyReguseBottomUp:           return "LatencyReguseBottomUp";
+  case ReguseLatencyBottomUp:           return "ReguseLatencyBottomUp";
+  case LatencyReguseDeepSearchBottomUp: return "LatencyReguseDeepSearchBottomUp";
+  };
+  llvm_unreachable("Unknown reason!");
+}
+
+void SIScheduleDAGMI::scheduleWithVariant(SIScheduleVariant variant)
+{
+  float score;
+  prepareScheduleVariant();
+
+  DEBUG(dbgs() << "Variant: " << getVariantStr(variant) << "\n");
+  currentVariant = variant;
+  while (SIBlockSchedule *Block = pickBlock()) {
+    BlockScheduleOrder.push_back(Block->ID);
+    blockScheduled(Block);
+  }
+
+  DEBUG(
+    dbgs() << "Block Order:";
+    for (unsigned i = 0, e = BlockScheduleOrder.size(); i != e; ++i) {
+      dbgs() << " " << BlockScheduleOrder[i];
+    }
+  );
+
+  DEBUG(dbgs() << "\nScore to hide latencies (Higher is better): ");
+  score = getSchedulingScore();
+  DEBUG(dbgs() << score << "\n\n");
+
+  // TODO: call improveSchedule;
+  if (score > bestVariantScore) {
+    bestVariantScore = score;
+    bestVariant = variant;
+    bestBlockScheduleOrder = BlockScheduleOrder;
+  }
+}
+
+void SIScheduleDAGMI::improveSchedule()
+{
+  // TODO
+}
+void SIScheduleDAGMI::schedule()
+{
+  prepareSchedule();
+  bestVariant = LatencyOnlyTopDown;
+  bestVariantScore = -1.;
+  bestBlockScheduleOrder.clear();
+
+  for (unsigned v = LatencyOnlyTopDown; v <= ReguseLatencyTopDown/*LatencyReguseDeepSearchBottomUp*/; v++) {
+    scheduleWithVariant(SIScheduleVariant(v));
+  }
+
+  DEBUG(dbgs() << "Best Variant: " << getVariantStr(bestVariant) << "\n");
+  if (bestVariant == LatencyReguseTopDown) dbgs() << "used1\n";
+  if (bestVariant == ReguseLatencyTopDown) dbgs() << "used2\n";
+  ScheduledSUnits.clear();
+  ScheduledSUnitsInv.resize(SUnits.size()); // do only now as SUnits wasn't filled before
+
+  for (unsigned b = 0; b < Blocks.size(); b++) {
+    SIBlockSchedule *Block = Blocks[bestBlockScheduleOrder[b]].get();
+    std::vector<SUnit*> SUs = Block->getScheduledUnits();
+
+    for (unsigned i = 0, e = SUs.size(); i != e; ++i) {
+      ScheduledSUnitsInv[SUs[i]->NodeNum] = ScheduledSUnits.size();
+      ScheduledSUnits.push_back(SUs[i]->NodeNum);
+    }
+  }
+
+  moveLowLatencies();
+
+  assert(TopRPTracker.getPos() == RegionBegin && "bad initial Top tracker");
+  TopRPTracker.setPos(CurrentTop);
+
+  for (unsigned i = 0, e = ScheduledSUnits.size(); i != e; ++i) {
+    SUnit *SU = &SUnits[ScheduledSUnits[i]];
+
+    scheduleMI(SU, true);
+
+    DEBUG(dbgs() << "Scheduling SU(" << SU->NodeNum << ") " << *SU->getInstr());
+  }
+
+  assert(CurrentTop == CurrentBottom && "Nonempty unscheduled zone.");
+
+  placeDebugValues();
+
+  DEBUG({
+      unsigned BBNum = begin()->getParent()->getNumber();
+      dbgs() << "*** Final schedule for BB#" << BBNum << " ***\n";
+      dumpSchedule();
+      dbgs() << '\n';
+    });
+
+  Blocks.clear();
+  TopDownIndex2Node.clear();
+  TopDownNode2Index.clear();
+  BottomUpIndex2Node.clear();
+  BottomUpNode2Index.clear();
+  Node2Block.clear();
+}
