@@ -1512,9 +1512,23 @@ float SIScheduleDAGMI::getSchedulingScore()
 
   for (unsigned b = 0; b < Blocks.size(); b++) {
     unsigned HidingCost;
+    unsigned firstPosUserScheduled = Blocks.size() - 1;;
     SIBlockSchedule *Block = Blocks[BlockScheduleOrder[b]].get();
-    if (Block->isHighLatencyBlock() && Block->firstPosUserScheduled > b) {
-      HidingCost = sumBlockCosts[Block->firstPosUserScheduled] - sumBlockCosts[b + 1];
+    
+      for (unsigned c = 0; c < Block->Succs.size(); c++) {
+        unsigned succIndex;
+        for (unsigned b2 = 0; b2 < Blocks.size(); b2++) {
+          if (BlockScheduleOrder[b2] == Block->Succs[c]->ID) {
+            succIndex = b2;
+            break;
+          }
+        }
+        if (succIndex <= firstPosUserScheduled)
+          firstPosUserScheduled = succIndex;
+      }
+    
+    if (Block->isHighLatencyBlock() && firstPosUserScheduled > b) {
+      HidingCost = sumBlockCosts[firstPosUserScheduled] - sumBlockCosts[b + 1];
       numHighLatInstructions++;
       if (HidingCost < minCostLatencyHiding)
         minCostLatencyHiding = HidingCost;
@@ -1656,7 +1670,16 @@ void SIScheduleDAGMI::scheduleWithVariant(SIScheduleVariant variant)
   score = getSchedulingScore();
   DEBUG(dbgs() << score << "\n\n");
 
-  // TODO: call improveSchedule;
+  DEBUG(dbgs() << "Optimising\n");
+  //improveSchedule();
+  DEBUG(
+    dbgs() << "Block Order:";
+    for (unsigned i = 0, e = BlockScheduleOrder.size(); i != e; ++i) {
+      dbgs() << " " << BlockScheduleOrder[i];
+    }
+  );
+  score = getSchedulingScore();
+  DEBUG(dbgs() << "New score: " << score << "\n\n");
   if (score > bestVariantScore) {
     bestVariantScore = score;
     bestVariant = variant;
@@ -1667,6 +1690,104 @@ void SIScheduleDAGMI::scheduleWithVariant(SIScheduleVariant variant)
 void SIScheduleDAGMI::improveSchedule()
 {
   // TODO
+  std::vector<unsigned> sumBlockCosts;
+  unsigned minCostLatencyHiding = SUnits.size();
+  unsigned sumCostLatencyHiding = 0;
+  unsigned numHighLatInstructions = 0;
+  unsigned numWavefronts;
+  unsigned maxVGPRUsage = 0;
+  bool changed = true;
+  unsigned numChanged = 0;
+  float score;
+  std::vector<unsigned> backupOrder;
+
+  sumBlockCosts.reserve(Blocks.size());
+
+  for (unsigned b = 0; b < Blocks.size(); b++) {
+    SIBlockSchedule *Block = Blocks[BlockScheduleOrder[b]].get();
+    if (b == 0)
+      sumBlockCosts[b] = Block->getCost();
+    else
+      sumBlockCosts[b] = sumBlockCosts[b-1] + Block->getCost();
+    if (VGPRSUsedAfterBlock[b] > maxVGPRUsage)
+      maxVGPRUsage = VGPRSUsedAfterBlock[b];
+  }
+
+  for (unsigned b = 0; b < Blocks.size(); b++) {
+    unsigned HidingCost;
+    SIBlockSchedule *Block = Blocks[BlockScheduleOrder[b]].get();
+    if (Block->isHighLatencyBlock() && Block->firstPosUserScheduled > b) {
+      HidingCost = sumBlockCosts[Block->firstPosUserScheduled] - sumBlockCosts[b + 1];
+      numHighLatInstructions++;
+      if (HidingCost < minCostLatencyHiding)
+        minCostLatencyHiding = HidingCost;
+      sumCostLatencyHiding += HidingCost;
+    }
+  }
+
+  if (numHighLatInstructions == 0) {
+    DEBUG(dbgs() << "Nothing to optimise\n");
+    return;
+  }
+
+  numWavefronts = getWaveFrontsForUsage(0, maxVGPRUsage);
+
+  while (changed) {
+    changed = false;
+    score = getSchedulingScore();
+    backupOrder = BlockScheduleOrder;
+    for (unsigned b = 0; b < Blocks.size(); b++) {
+      SIBlockSchedule *Block = Blocks[BlockScheduleOrder[b]].get();
+      unsigned schedPos = BlockScheduleOrder[b];
+      unsigned firstPossibleIndex = 0;
+      unsigned lastPossibleIndex = Blocks.size() - 1;
+      for (unsigned c = 0; c < Block->Preds.size(); c++) {
+        unsigned predIndex;
+        for (unsigned b2 = 0; b2 < Blocks.size(); b2++) {
+          if (BlockScheduleOrder[b2] == Block->Preds[c]->ID) {
+            predIndex = b2;
+            break;
+          }
+        }
+        if (predIndex >= firstPossibleIndex)
+          firstPossibleIndex = predIndex + 1;
+      }
+      for (unsigned c = 0; c < Block->Succs.size(); c++) {
+        unsigned succIndex;
+        for (unsigned b2 = 0; b2 < Blocks.size(); b2++) {
+          if (BlockScheduleOrder[b2] == Block->Succs[c]->ID) {
+            succIndex = b2;
+            break;
+          }
+        }
+        if (succIndex <= lastPossibleIndex)
+          lastPossibleIndex = succIndex;
+      }
+      assert (firstPossibleIndex <= b && b <= lastPossibleIndex);
+      if (firstPossibleIndex == lastPossibleIndex)
+        continue;
+      for (unsigned i = firstPossibleIndex; i <= lastPossibleIndex; i++) {
+        float newScore;
+        if (i < b) {
+          BlockScheduleOrder.erase(BlockScheduleOrder.begin() + b);
+          BlockScheduleOrder.insert(BlockScheduleOrder.begin() + i, schedPos);
+        } else if (i > b) {
+          BlockScheduleOrder.insert(BlockScheduleOrder.begin() +  i, schedPos);
+          BlockScheduleOrder.erase(BlockScheduleOrder.begin() + b);
+        }
+        newScore = getSchedulingScore();
+        if (newScore > score) {
+          changed = true;
+          numChanged++;
+          break;
+        }
+        BlockScheduleOrder = backupOrder;
+      }
+      if (changed)
+        break;
+    }
+  }
+  DEBUG(dbgs() << "Number of moves: " << numChanged << "\n");
 }
 void SIScheduleDAGMI::schedule()
 {
