@@ -63,11 +63,11 @@ class SIBlockSchedule {
   IntervalPressure Pressure;
   RegPressureTracker RPTracker;
 
-  std::vector<unsigned> InternalPressure;
+  std::vector<unsigned> InternalAdditionnalPressure;
   std::vector<unsigned> LiveInPressure;
   std::vector<unsigned> LiveOutPressure;
-  SmallVector<unsigned,8> LiveInRegs;
-  SmallVector<unsigned,8> LiveOutRegs;
+  std::set<unsigned> LiveInRegs;
+  std::set<unsigned> LiveOutRegs;
 
   bool scheduled;
   bool highLatencyBlock;
@@ -77,11 +77,78 @@ public:
     DAG(dag), SUnits(), TopReadySUs(), BottomReadySUs(), ScheduledSUnits(),
     TopRPTracker(TopPressure), BotRPTracker(BotPressure), RPTracker(Pressure),
     scheduled(false), highLatencyBlock(isHighLatencyBlock), ID(ID),
-    lastPosHighLatencyParentScheduled(0), firstPosUserScheduled(0),
     Preds(), Succs(), NumPredsLeft(0), NumSuccsLeft(0) {};
 
-  void addUnit(SUnit *SU);
+  // Unique ID, the index of the Block in the SIScheduleDAGMI Blocks table
+  unsigned ID;
 
+  /// functions for Block construction
+  void addUnit(SUnit *SU);
+  // Add block pred, which has instruction predecessor of SU.
+  void addPred(SIBlockSchedule *pred);
+  void addSucc(SIBlockSchedule *succ);
+  // InOrOutBlock: restrict to links pointing inside the block (true),
+  // or restrict to links pointing outside the block (false).
+  void releaseSuccessors(SUnit *SU, bool InOrOutBlock);
+  void releasePredecessors(SUnit *SU, bool InOrOutBlock);
+
+  std::vector<SIBlockSchedule*> Preds;  // All blocks predecessors.
+  std::vector<SIBlockSchedule*> Succs;  // All blocks successors.
+
+  unsigned NumPredsLeft;
+  unsigned NumSuccsLeft;
+
+  bool isHighLatencyBlock() {return highLatencyBlock;}
+  // TODO: should take into accounts some instructions (rcp, etc) are 4 times slower
+  int getCost() {return SUnits.size();}
+
+  // The block Predecessors and Successors must be all registered
+  // before schedule()
+  // fast schedule with no particular requirement
+  void fastSchedule();
+  std::vector<SUnit*> getScheduledUnits() {return ScheduledSUnits;}
+
+  // Complete schedule that will take try to minimize reg pressure, and will
+  // fill correct track of liveins and liveouts.
+  // Needs all MIs to be groupped begin BeginBlock and EndBlock.
+  // The MIs can be moved after the scheduling. It is just used to allow precise computation.
+  void schedule(MachineBasicBlock::iterator BeginBlock, MachineBasicBlock::iterator EndBlock);
+  bool isScheduled() {return scheduled;}
+
+
+  /// Needs the block to be scheduled inside
+  // TODO: find a way to have better computation here.
+  std::vector<unsigned> &getInternalAdditionnalRegUsage() { return InternalAdditionnalPressure;}
+  // Pressure = sum_alive_registers register size
+  // Internally llvm will represent some registers as big 128 bits registers for example,
+  // but they actually correspond to 4 actual 32 bits registers for example.
+  // Thus Pressure is not equal to num_alive_registers * constant.
+  std::set<unsigned> &getInRegs() {return LiveInRegs;}
+  std::set<unsigned> &getOutRegs() {return LiveOutRegs;}
+
+  // How many blocks use the outputs registers
+  std::map<unsigned, unsigned> LiveOutRegsNumUsages;
+
+  /// data associated to the Block that can be modified freely during the whole scheduling process
+  // Store at which pos the last High latency parent was scheduled - Used only during Block scheduling,
+  // not valid after
+  unsigned lastPosHighLatencyParentScheduled;
+  // Filled during Block Scheduling, and updated during improveSchedule.
+  unsigned currentPosInBlockSchedule;
+  // for high latencies, true if a child block was scheduled - Used only during Block scheduling
+  bool atLeastOneChildScheduled;
+  // 1 if <index> Parent is a high latency Block and it is the first scheduled child of this parent
+  // Filled during Block Scheduling, and updated during improveSchedule.
+  SmallVector<unsigned,8> IsFirstChildOfHighLat;
+  // Filled during Block Scheduling, and updated during improveSchedule.
+  unsigned VGPRSUsedAfterBlock;
+  // Contains registers that are inputs, and released by the current Block (and are not outputs)
+  // Filled during Block Scheduling, and updated during improveSchedule.
+  std::set<unsigned> InRegsReleased;
+
+  void printDebug(bool full);
+
+private:
   struct SISchedCandidate : SISchedulerCandidate {
     // The best SUnit candidate.
     SUnit *SU;
@@ -105,61 +172,6 @@ public:
     }
   };
 
-  // The block Predecessors and Successors must be all registered
-  // before scheduling
-  // fast schedule with no particular requirement
-  void fastSchedule();
-
-  // Complete schedule that will take try to minimize reg pressure, and will
-  // fill correct track of liveins and liveouts.
-  // Needs all MIs to be groupped begin BeginBlock and EndBlock.
-  // The MIs can be moved after the scheduling. It is just used to allow precise computation.
-  void schedule(MachineBasicBlock::iterator BeginBlock, MachineBasicBlock::iterator EndBlock);
-  bool isScheduled() {return scheduled;}
-  bool isHighLatencyBlock() {return highLatencyBlock;}
-
-  // TODO: should take into accounts some instructions (rcp, etc) are 4 times slower
-  int getCost() {return SUnits.size();}
-
-  std::vector<SUnit*> getScheduledUnits() {return ScheduledSUnits;}
-  // TODO: find a way to have better computation here. It returns the maximum Pressure inside the block, but
-  // it counts potentially some liveins and liveouts.
-  std::vector<unsigned> &getInternalRegUsage() { return InternalPressure;}
-  // Pressure = sum_alive_registers register size
-  // Internally llvm will represent some registers as big 128 bits registers for example,
-  // but they actually correspond to 4 actual 32 bits registers for example.
-  // Thus Pressure is not equal to num_alive_registers * constant.
-  std::vector<unsigned> &getInRegUsage() {return LiveInPressure;}
-  std::vector<unsigned> &getOutRegUsage() {return LiveOutPressure;}
-  ArrayRef<unsigned> getInRegs() {return LiveInRegs;}
-  ArrayRef<unsigned> getOutRegs() {return LiveOutRegs;}
-  // How many blocks use the outputs registers
-  SmallVector<unsigned,8> LiveOutRegsNumUsages;
-
-  unsigned ID;
-  // Store at which pos the last High latency parent was scheduled
-  unsigned lastPosHighLatencyParentScheduled;
-  // Position of the first block using the outputs
-  unsigned firstPosUserScheduled;
-
-  std::vector<SIBlockSchedule*> Preds;  // All blocks predecessors.
-  std::vector<SIBlockSchedule*> Succs;  // All blocks successors.
-
-  unsigned NumPredsLeft;
-  unsigned NumSuccsLeft;
-
-  /// Add block pred, which has instruction predecessor of SU.
-  void addPred(SIBlockSchedule *pred);
-  void addSucc(SIBlockSchedule *succ);
-
-  // InOrOutBlock: restrict to links pointing inside the block (true),
-  // or restrict to links pointing outside the block (false).
-  void releaseSuccessors(SUnit *SU, bool InOrOutBlock);
-  void releasePredecessors(SUnit *SU, bool InOrOutBlock);
-
-  void printDebug(bool full);
-
-private:
   void undoSchedule();
   void undoReleaseSucc(SUnit *SU, SDep *SuccEdge, bool InOrOutBlock);
   void releaseSucc(SUnit *SU, SDep *SuccEdge, bool InOrOutBlock);
@@ -200,7 +212,7 @@ class SIScheduleDAGMI : public ScheduleDAGMILive {
   std::set<unsigned> LiveRegs;
   std::map<unsigned, unsigned> LiveRegsConsumers; // num of schedulable unscheduled blocks reading the register
   std::vector<unsigned> BlockScheduleOrder;
-  std::vector<unsigned> VGPRSUsedAfterBlock;
+  unsigned InitVGPRUsage;
 
 public:
   SIScheduleDAGMI(MachineSchedContext *C);
@@ -266,13 +278,14 @@ private:
   void moveLowLatencies();
   // To help the schedule
   // check register pressure change by scheduling a block with these LiveIn and LiveOut
-  std::vector<int> checkRegUsageImpact(ArrayRef<unsigned> InRegs, ArrayRef<unsigned> OutRegs);
+  std::vector<int> checkRegUsageImpact(std::set<unsigned> &InRegs, std::set<unsigned> &OutRegs);
   // reinits what needs to be.
   void prepareScheduleVariant();
-  void addLiveRegs(ArrayRef<unsigned> Regs);
-  void decreaseLiveRegs(ArrayRef<unsigned> Regs);
+  void addLiveRegs(std::set<unsigned> &Regs);
+  void decreaseLiveRegs(SIBlockSchedule *Block, std::set<unsigned> &Regs);
   void releaseBlockSuccs(SIBlockSchedule *Parent);
   void blockScheduled(SIBlockSchedule *Block);
+  template<typename _Iterator> unsigned VgprCost(_Iterator first, _Iterator end);
   // higher is better
   float getSchedulingScore();
   // More Wavefronts = better latency hidding
@@ -294,6 +307,8 @@ private:
   SIBlockSchedule *pickBlock();
   const char *getVariantStr(SIScheduleVariant variant);
   void scheduleWithVariant(SIScheduleVariant variant);
+
+  void exchangeScheduledBlocks(int firstBlockPos);
 
   // Once a schedule Variant is run, compute current wavefront count, and try
   // move latency instructions to keep this wavefront count the same, but with better
