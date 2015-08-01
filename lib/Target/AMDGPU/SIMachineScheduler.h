@@ -145,6 +145,8 @@ public:
   // Contains registers that are inputs, and released by the current Block (and are not outputs)
   // Filled during Block Scheduling, and updated during improveSchedule.
   std::set<unsigned> InRegsReleased;
+  // cost hiding the latency
+  unsigned LatHidingCost;
 
   void printDebug(bool full);
 
@@ -156,6 +158,7 @@ private:
     // WaveFronts estimated if the best candidate is scheduled
     unsigned VGPRUsage;
     bool isLowLatency;
+    unsigned lowLatencyOffset;
 
     SISchedCandidate()
       : SU(nullptr) {}
@@ -169,6 +172,7 @@ private:
       Reason = Best.Reason;
       VGPRUsage = Best.VGPRUsage;
       isLowLatency = Best.isLowLatency;
+      lowLatencyOffset = Best.lowLatencyOffset;
     }
   };
 
@@ -213,6 +217,10 @@ class SIScheduleDAGMI : public ScheduleDAGMILive {
   std::map<unsigned, unsigned> LiveRegsConsumers; // num of schedulable unscheduled blocks reading the register
   std::vector<unsigned> BlockScheduleOrder;
   unsigned InitVGPRUsage;
+
+  // for optimizing
+  std::multiset<unsigned> VGPRUsages;
+  std::multiset<unsigned> CostsHidingHighLatencies;
 
 public:
   SIScheduleDAGMI(MachineSchedContext *C);

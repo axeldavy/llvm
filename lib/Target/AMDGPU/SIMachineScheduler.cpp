@@ -156,6 +156,8 @@ void SIBlockSchedule::tryCandidateTopDown(SISchedCandidate &Cand,
   // we have low latency instructions that need other low latency instructions
   // results.
   // We will get low latency instructions - independant instructions - eventual low latency instructions - etc
+  if (tryLess(TryCand.lowLatencyOffset, Cand.lowLatencyOffset, TryCand, Cand, Depth))
+    return;
   if (tryGreater(TryCand.isLowLatency, Cand.isLowLatency, TryCand, Cand, Depth))
     return;
 
@@ -179,12 +181,13 @@ void SIBlockSchedule::tryCandidateBottomUp(SISchedCandidate &Cand,
   // Schedule low latency instructions as top as possible
   if (tryLess(TryCand.isLowLatency, Cand.isLowLatency, TryCand, Cand, Depth))
     return;
+  if (tryGreater(TryCand.lowLatencyOffset, Cand.lowLatencyOffset, TryCand, Cand, Depth))
+    return;
 
   if (tryLess(TryCand.VGPRUsage, Cand.VGPRUsage, TryCand, Cand, RegUsage))
     return;
 
-  // if everything would increase register usage, then encourage depth traversal
-  //if ( TODO )
+  // Encourage depth traversal
   if (tryLess(TryCand.SU->getDepth(), Cand.SU->getDepth(), TryCand, Cand, Depth))
     return;
 
@@ -197,6 +200,7 @@ void SIBlockSchedule::tryCandidateBottomUp(SISchedCandidate &Cand,
 SUnit* SIBlockSchedule::pickNode(bool TopOnly, bool &isTop) {
   SISchedCandidate TopCand;
   SISchedCandidate BotCand;
+  unsigned BaseLatReg, OffLatReg;
 
   for (std::vector<SUnit*>::iterator I = TopReadySUs.begin(), E = TopReadySUs.end(); I != E; ++I) {
     SISchedCandidate TryCand;
@@ -206,6 +210,10 @@ SUnit* SIBlockSchedule::pickNode(bool TopOnly, bool &isTop) {
     TryCand.SU = *I;
     TryCand.VGPRUsage = pressure[26];
     TryCand.isLowLatency = DAG->SITII->isLowLatencyInstruction(TryCand.SU->getInstr());
+    TryCand.lowLatencyOffset = 0;
+    if (TryCand.isLowLatency && DAG->SITII->getLdStBaseRegImmOfs(TryCand.SU->getInstr(), BaseLatReg, OffLatReg, DAG->getTRI())) {
+      TryCand.lowLatencyOffset = OffLatReg;
+    }
     tryCandidateTopDown(TopCand, TryCand);
     if (TryCand.Reason != NoCand) {
       TopCand.setBest(TryCand);
@@ -226,6 +234,10 @@ SUnit* SIBlockSchedule::pickNode(bool TopOnly, bool &isTop) {
     TryCand.SU = *I;
     TryCand.VGPRUsage = pressure[26];
     TryCand.isLowLatency = DAG->SITII->isLowLatencyInstruction(TryCand.SU->getInstr());
+    TryCand.lowLatencyOffset = 0;
+    if (TryCand.isLowLatency && DAG->SITII->getLdStBaseRegImmOfs(TryCand.SU->getInstr(), BaseLatReg, OffLatReg, DAG->getTRI())) {
+      TryCand.lowLatencyOffset = OffLatReg;
+    }
     tryCandidateBottomUp(BotCand, TryCand);
     if (TryCand.Reason != NoCand) {
       BotCand.setBest(TryCand);
@@ -1523,12 +1535,12 @@ void SIScheduleDAGMI::blockScheduled(SIBlockSchedule *Block) {
       LiveRegsConsumers[RegP.first] += RegP.second;
   }
   for (unsigned i = 0, e = Block->Preds.size(); i != e; ++i) {
-    SIBlockSchedule *Parent = Blocks[Block->Preds[i]->ID].get();
+    SIBlockSchedule *Parent = Block->Preds[i];
     if (Parent->isHighLatencyBlock() && !Parent->atLeastOneChildScheduled) {
       Parent->atLeastOneChildScheduled = true;
-      Block->IsFirstChildOfHighLat.push_back(true);
-    }
-    Block->IsFirstChildOfHighLat.push_back(false);
+      Block->IsFirstChildOfHighLat.push_back(1);
+    } else
+      Block->IsFirstChildOfHighLat.push_back(0);
   }
   Block->currentPosInBlockSchedule = numBlockScheduled;
   numBlockScheduled++;
@@ -1538,7 +1550,7 @@ float SIScheduleDAGMI::getSchedulingScore()
 {
   std::vector<unsigned> sumBlockCosts;
   unsigned minCostLatencyHiding = SUnits.size();
-  unsigned meanCostLatencyHiding = 0;
+  unsigned sumCostLatencyHiding = 0;
   unsigned numHighLatInstructions = 0;
   unsigned numWavefronts;
   unsigned maxVGPRUsage = 0;
@@ -1566,27 +1578,26 @@ float SIScheduleDAGMI::getSchedulingScore()
         unsigned HidingCost = sumCostBeforeBlock - sumCostParent;
         if (HidingCost < minCostLatencyHiding)
           minCostLatencyHiding = HidingCost;
-        meanCostLatencyHiding += HidingCost;
+        sumCostLatencyHiding += HidingCost;
       }
     }
     if (Block->isHighLatencyBlock())
       numHighLatInstructions++;
   }
 
-  if (numHighLatInstructions)
-    meanCostLatencyHiding /= numHighLatInstructions;
-
   numWavefronts = getWaveFrontsForUsage(0, maxVGPRUsage);
-  DEBUG(dbgs() << "(determined Wavefront Count: " << numWavefronts << ") " << maxVGPRUsage << " " << meanCostLatencyHiding << " " << minCostLatencyHiding << " ");
+  DEBUG(dbgs() << "(determined Wavefront Count: " << numWavefronts << ") " << maxVGPRUsage << " " << sumCostLatencyHiding << " " << numHighLatInstructions * minCostLatencyHiding << " \n");
   
 
-  return (meanCostLatencyHiding + minCostLatencyHiding) * numWavefronts;
+  return (sumCostLatencyHiding + numHighLatInstructions * minCostLatencyHiding) * numWavefronts;
 }
 
 unsigned SIScheduleDAGMI::getWaveFrontsForUsage(unsigned SGPRsUsed,
                                                 unsigned VGPRsUsed) {
   unsigned i;
 
+  if (VGPRsUsed >= 250)
+    return 0;
   for (i = 9; i > 0; i--) {
     if (SGPRsForWaveFronts[i] >= SGPRsUsed &&
         VGPRsForWaveFronts[i] >= VGPRsUsed)
@@ -1736,7 +1747,7 @@ void SIScheduleDAGMI::exchangeScheduledBlocks(int firstBlockPos)
 {
   SIBlockSchedule *b1 = Blocks[BlockScheduleOrder[firstBlockPos]].get();
   SIBlockSchedule *b2 = Blocks[BlockScheduleOrder[firstBlockPos+1]].get();
-  unsigned VGPRsb0 = firstBlockPos == 0 ? InitVGPRUsage : Blocks[BlockScheduleOrder[firstBlockPos]]->VGPRSUsedAfterBlock;
+  unsigned VGPRsb0 = firstBlockPos == 0 ? InitVGPRUsage : Blocks[BlockScheduleOrder[firstBlockPos-1]]->VGPRSUsedAfterBlock;
   unsigned VGPRsb1 = b1->VGPRSUsedAfterBlock;
   unsigned VGPRsb2 = b2->VGPRSUsedAfterBlock;
   unsigned b1pos = 0, b2pos = 0;
@@ -1756,6 +1767,9 @@ void SIScheduleDAGMI::exchangeScheduledBlocks(int firstBlockPos)
   b1->VGPRSUsedAfterBlock = VGPRsb2;
   b2->VGPRSUsedAfterBlock = VGPRsb2 - VGPRsb1 + VGPRsb0 - VgprCost(InRegsReleased_b2_prev_intersect_IN_b1.begin(), InRegsReleased_b2_prev_intersect_IN_b1.end());
 
+  VGPRUsages.erase(VGPRUsages.find(VGPRsb1));
+  VGPRUsages.insert(b2->VGPRSUsedAfterBlock);
+
   b2->currentPosInBlockSchedule = firstBlockPos;
   b1->currentPosInBlockSchedule = firstBlockPos + 1;
   std::swap(BlockScheduleOrder[firstBlockPos], BlockScheduleOrder[firstBlockPos+1]);
@@ -1765,21 +1779,65 @@ void SIScheduleDAGMI::exchangeScheduledBlocks(int firstBlockPos)
       SIBlockSchedule *b1Pred = b1->Preds[b1pos];
       SIBlockSchedule *b2Pred = b2->Preds[b2pos];
 
-      if (b1->IsFirstChildOfHighLat[b1pos]) {
-        if (b1Pred->ID == b2Pred->ID) {
+      if (b1Pred->ID == b2Pred->ID) {
+        if (b1->IsFirstChildOfHighLat[b1pos]) {
           b2->IsFirstChildOfHighLat[b2pos] = true;
           b1->IsFirstChildOfHighLat[b1pos] = false;
         }
-      }
-
-      if (b1Pred->ID <= b2Pred->ID)
         b1pos++;
-      if (b2Pred->ID <= b1Pred->ID)
         b2pos++;
-
-      if (b1pos == b1->Preds.size() || b2pos == b2->Preds.size())
-        break;
+        if (b1pos == b1->Preds.size() || b2pos == b2->Preds.size())
+          break;
+      } else if (b1Pred->ID < b2Pred->ID) {
+        if (b1->IsFirstChildOfHighLat[b1pos]) {
+          CostsHidingHighLatencies.erase(CostsHidingHighLatencies.find(b1Pred->LatHidingCost));
+          b1Pred->LatHidingCost += b2->getCost();
+          CostsHidingHighLatencies.insert(b1Pred->LatHidingCost);
+        }
+        b1pos++;
+        if (b1pos == b1->Preds.size())
+          break;
+      } else {
+        if (b2->IsFirstChildOfHighLat[b2pos]) {
+          CostsHidingHighLatencies.erase(CostsHidingHighLatencies.find(b2Pred->LatHidingCost));
+          b2Pred->LatHidingCost -= b1->getCost();
+          CostsHidingHighLatencies.insert(b2Pred->LatHidingCost);
+        }
+        b2pos++;
+        if (b2pos == b2->Preds.size())
+          break;
+      }
     }
+  }
+
+  for (;b1pos < b1->Preds.size(); b1pos++) {
+    SIBlockSchedule *b1Pred = b1->Preds[b1pos];
+    if (b1->IsFirstChildOfHighLat[b1pos]) {
+      CostsHidingHighLatencies.erase(CostsHidingHighLatencies.find(b1Pred->LatHidingCost));
+      b1Pred->LatHidingCost += b2->getCost();
+      CostsHidingHighLatencies.insert(b1Pred->LatHidingCost);
+    }
+  }
+
+  for (;b2pos < b2->Preds.size(); b2pos++) {
+    SIBlockSchedule *b2Pred = b2->Preds[b2pos];
+    if (b2->IsFirstChildOfHighLat[b2pos]) {
+      CostsHidingHighLatencies.erase(CostsHidingHighLatencies.find(b2Pred->LatHidingCost));
+      b2Pred->LatHidingCost -= b1->getCost();
+      CostsHidingHighLatencies.insert(b2Pred->LatHidingCost);
+    }
+  }
+
+  if (b1->isHighLatencyBlock() && b1->Succs.size() > 0) {
+    CostsHidingHighLatencies.erase(CostsHidingHighLatencies.find(b1->LatHidingCost));
+    b1->LatHidingCost -= b2->getCost();
+    CostsHidingHighLatencies.insert(b1->LatHidingCost);
+  }
+
+  if (b2->isHighLatencyBlock() && b2->Succs.size() > 0) {
+    CostsHidingHighLatencies.erase(CostsHidingHighLatencies.find(b2->LatHidingCost));
+    b2->LatHidingCost += b1->getCost();
+    CostsHidingHighLatencies.insert(b2->LatHidingCost);
   }
 }
 
@@ -1788,81 +1846,95 @@ void SIScheduleDAGMI::improveSchedule()
   // TODO
   bool changed = true;
   unsigned numChanged = 0;
+  unsigned maxChanges = 100;
   float score;
   std::vector<unsigned> backupOrder;
 
-  while (changed) {
+  VGPRUsages.clear();
+  CostsHidingHighLatencies.clear();
+  
+  std::vector<unsigned> sumBlockCosts;
+
+  sumBlockCosts.reserve(Blocks.size());
+
+  for (unsigned b = 0; b < Blocks.size(); b++) {
+    SIBlockSchedule *Block = Blocks[BlockScheduleOrder[b]].get();
+    if (b == 0)
+      sumBlockCosts[b] = Block->getCost();
+    else
+      sumBlockCosts[b] = sumBlockCosts[b-1] + Block->getCost();
+    VGPRUsages.insert(Block->VGPRSUsedAfterBlock + Block->getInternalAdditionnalRegUsage()[26]);
+  }
+
+  for (unsigned b = 0; b < Blocks.size(); b++) {
+    SIBlockSchedule *Block = Blocks[b].get();
+    unsigned sumCostBeforeBlock = sumBlockCosts[Block->currentPosInBlockSchedule] - Block->getCost();
+    for (unsigned c = 0; c < Block->Preds.size(); c++) {
+      SIBlockSchedule *Parent = Block->Preds[c];
+      //implies Parent->isHighLatencyBlock()
+      if (Block->IsFirstChildOfHighLat[c]) {
+        unsigned sumCostParent = sumBlockCosts[Parent->currentPosInBlockSchedule];
+        unsigned HidingCost = sumCostBeforeBlock - sumCostParent;
+        Parent->LatHidingCost = HidingCost;
+        CostsHidingHighLatencies.insert(HidingCost);
+      }
+    }
+  }
+
+  while (changed && numChanged < maxChanges) {
     changed = false;
-    score = getSchedulingScore();
+    score = (std::accumulate(CostsHidingHighLatencies.begin(), CostsHidingHighLatencies.end(), 0) + CostsHidingHighLatencies.size() * *CostsHidingHighLatencies.begin()) * getWaveFrontsForUsage(0, *VGPRUsages.rbegin());
     backupOrder = BlockScheduleOrder;
-    for (unsigned b = 0; b < Blocks.size(); b++) {
+    for (int b = 0; b < (int)Blocks.size(); b++) {
+      int newb;
       SIBlockSchedule *Block = Blocks[BlockScheduleOrder[b]].get();
-      unsigned schedPos = BlockScheduleOrder[b];
-      unsigned firstPossibleIndex = 0;
-      unsigned lastPossibleIndex = Blocks.size() - 1;
+      int firstPossibleIndex = 0;
+      int lastPossibleIndex = Blocks.size() - 1;
       for (unsigned c = 0; c < Block->Preds.size(); c++) {
-        unsigned predIndex = Block->Preds[c]->currentPosInBlockSchedule;
-        /*for (unsigned b2 = 0; b2 < Blocks.size(); b2++) {
-          if (BlockScheduleOrder[b2] == Block->Preds[c]->ID) {
-            predIndex = b2;
-            break;
-          }
-        }*/
+        int predIndex = Block->Preds[c]->currentPosInBlockSchedule;
         if (predIndex >= firstPossibleIndex)
           firstPossibleIndex = predIndex + 1;
       }
       for (unsigned c = 0; c < Block->Succs.size(); c++) {
-        unsigned succIndex = Block->Succs[c]->currentPosInBlockSchedule;
-        /*for (unsigned b2 = 0; b2 < Blocks.size(); b2++) {
-          if (BlockScheduleOrder[b2] == Block->Succs[c]->ID) {
-            succIndex = b2;
-            break;
-          }
-        }*/
+        int succIndex = Block->Succs[c]->currentPosInBlockSchedule;
         if (succIndex <= lastPossibleIndex)
           lastPossibleIndex = succIndex - 1;
       }
-      assert (firstPossibleIndex <= b && b <= lastPossibleIndex);
-      dbgs() << "\n";
-      dbgs() << firstPossibleIndex << " " << lastPossibleIndex << " " << "\n";
+      DEBUG(assert (firstPossibleIndex <= b && b <= lastPossibleIndex));
       if (firstPossibleIndex == lastPossibleIndex)
         continue;
-      if (b < lastPossibleIndex)
-      {
+      for (newb = b; newb < lastPossibleIndex; newb++) {
         float newScore;
-        exchangeScheduledBlocks(b);
-        newScore = getSchedulingScore();
-        if (newScore > score) {
-          changed = true;
-          numChanged++;
-          DEBUG(
-    dbgs() << "Block Order:";
-    for (unsigned i = 0, e = BlockScheduleOrder.size(); i != e; ++i) {
-      dbgs() << " " << BlockScheduleOrder[i];
-    }
-    dbgs() << "\n";
-  );
-        } else {
-          exchangeScheduledBlocks(b);
-        }
-      }
-      /*for (unsigned i = firstPossibleIndex; i <= lastPossibleIndex; i++) {
-        float newScore;
-        if (i < b) {
-          BlockScheduleOrder.erase(BlockScheduleOrder.begin() + b);
-          BlockScheduleOrder.insert(BlockScheduleOrder.begin() + i, schedPos);
-        } else if (i > b) {
-          BlockScheduleOrder.insert(BlockScheduleOrder.begin() +  i, schedPos);
-          BlockScheduleOrder.erase(BlockScheduleOrder.begin() + b);
-        }
-        newScore = getSchedulingScore();
+        exchangeScheduledBlocks(newb);
+        newScore = (std::accumulate(CostsHidingHighLatencies.begin(), CostsHidingHighLatencies.end(), 0) + CostsHidingHighLatencies.size() * *CostsHidingHighLatencies.begin()) * getWaveFrontsForUsage(0, *VGPRUsages.rbegin());
+        assert (newScore == getSchedulingScore());
         if (newScore > score) {
           changed = true;
           numChanged++;
           break;
         }
-        BlockScheduleOrder = backupOrder;
-      }*/
+      }
+      if (changed)
+        break;
+      for (newb = lastPossibleIndex-1; newb >= b; newb--) {
+        exchangeScheduledBlocks(newb);
+      }
+      for (newb = b-1; newb >= firstPossibleIndex; newb--) {
+        float newScore;
+        exchangeScheduledBlocks(newb);
+        newScore = (std::accumulate(CostsHidingHighLatencies.begin(), CostsHidingHighLatencies.end(), 0) + CostsHidingHighLatencies.size() * *CostsHidingHighLatencies.begin()) * getWaveFrontsForUsage(0, *VGPRUsages.rbegin());
+        DEBUG(assert (newScore == getSchedulingScore()));
+        if (newScore > score) {
+          changed = true;
+          numChanged++;
+          break;
+        }
+      }
+      if (changed)
+        break;
+      for (newb = firstPossibleIndex; newb < b; newb++) {
+        exchangeScheduledBlocks(newb);
+      }
       if (changed)
         break;
     }
@@ -1881,8 +1953,8 @@ void SIScheduleDAGMI::schedule()
   }
 
   DEBUG(dbgs() << "Best Variant: " << getVariantStr(bestVariant) << "\n");
-  if (bestVariant == LatencyReguseTopDown) dbgs() << "used1\n";
-  if (bestVariant == ReguseLatencyTopDown) dbgs() << "used2\n";
+  //if (bestVariant == LatencyReguseTopDown) dbgs() << "used1\n";
+  //if (bestVariant == ReguseLatencyTopDown) dbgs() << "used2\n";
   ScheduledSUnits.clear();
   ScheduledSUnitsInv.resize(SUnits.size()); // do only now as SUnits wasn't filled before
 
