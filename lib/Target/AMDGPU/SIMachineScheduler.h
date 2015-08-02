@@ -49,7 +49,6 @@ class SIBlockSchedule {
 
   std::vector<SUnit*> SUnits;
   std::vector<SUnit*> TopReadySUs;
-  std::vector<SUnit*> BottomReadySUs;
   std::vector<SUnit*> ScheduledSUnits;
 
   /// The top of the unscheduled zone.
@@ -74,7 +73,7 @@ class SIBlockSchedule {
 
 public:
   SIBlockSchedule(SIScheduleDAGMI *dag, unsigned ID, bool isHighLatencyBlock):
-    DAG(dag), SUnits(), TopReadySUs(), BottomReadySUs(), ScheduledSUnits(),
+    DAG(dag), SUnits(), TopReadySUs(), ScheduledSUnits(),
     TopRPTracker(TopPressure), BotRPTracker(BotPressure), RPTracker(Pressure),
     scheduled(false), highLatencyBlock(isHighLatencyBlock), ID(ID),
     Preds(), Succs(), NumPredsLeft(0), NumSuccsLeft(0) {};
@@ -90,7 +89,6 @@ public:
   // InOrOutBlock: restrict to links pointing inside the block (true),
   // or restrict to links pointing outside the block (false).
   void releaseSuccessors(SUnit *SU, bool InOrOutBlock);
-  void releasePredecessors(SUnit *SU, bool InOrOutBlock);
 
   std::vector<SIBlockSchedule*> Preds;  // All blocks predecessors.
   std::vector<SIBlockSchedule*> Succs;  // All blocks successors.
@@ -155,10 +153,11 @@ private:
     // The best SUnit candidate.
     SUnit *SU;
 
-    // WaveFronts estimated if the best candidate is scheduled
+    unsigned SGPRUsage;
     unsigned VGPRUsage;
     bool isLowLatency;
     unsigned lowLatencyOffset;
+    bool hasLowLatencyNonWaitedParent;
 
     SISchedCandidate()
       : SU(nullptr) {}
@@ -170,20 +169,21 @@ private:
       assert(Best.Reason != NoCand && "uninitialized Sched candidate");
       SU = Best.SU;
       Reason = Best.Reason;
+      SGPRUsage = Best.SGPRUsage;
       VGPRUsage = Best.VGPRUsage;
       isLowLatency = Best.isLowLatency;
       lowLatencyOffset = Best.lowLatencyOffset;
+      hasLowLatencyNonWaitedParent = Best.hasLowLatencyNonWaitedParent;
     }
   };
 
   void undoSchedule();
   void undoReleaseSucc(SUnit *SU, SDep *SuccEdge, bool InOrOutBlock);
   void releaseSucc(SUnit *SU, SDep *SuccEdge, bool InOrOutBlock);
-  void releasePred(SUnit *SU, SDep *PredEdge, bool InOrOutBlock);
   void NodeScheduled(SUnit *SU);
   void tryCandidateTopDown(SISchedCandidate &Cand, SISchedCandidate &TryCand);
   void tryCandidateBottomUp(SISchedCandidate &Cand, SISchedCandidate &TryCand);
-  SUnit* pickNode(bool TopOnly, bool &isTop);
+  SUnit* pickNode();
   void traceCandidate(const SISchedCandidate &Cand);
   void initRegPressure(MachineBasicBlock::iterator BeginBlock, MachineBasicBlock::iterator EndBlock);
 };
@@ -276,6 +276,8 @@ public:
   MachineRegisterInfo *getMRI() {return &MRI;}
   const TargetRegisterInfo *getTRI() {return TRI;}
 
+  void propagateWaitedLatencies();
+
 private:
   // To prepare the schedule
   void prepareSchedule();
@@ -326,9 +328,13 @@ private:
 public:
   const SIInstrInfo *SITII;
   const SIRegisterInfo *SITRI;
+  // some stats for scheduling inside blocks
+  std::vector<unsigned> isLowlatencySU;
+  std::vector<unsigned> LowLatencyOffset;
+  std::vector<unsigned> hasLowLatencyNonWaitedParent;
 };
 
 } // namespace llvm
 
 #endif /* SIMACHINESCHEDULER_H_ */
- 
+

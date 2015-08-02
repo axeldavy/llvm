@@ -156,9 +156,17 @@ void SIBlockSchedule::tryCandidateTopDown(SISchedCandidate &Cand,
   // we have low latency instructions that need other low latency instructions
   // results.
   // We will get low latency instructions - independant instructions - eventual low latency instructions - etc
-  if (tryLess(TryCand.lowLatencyOffset, Cand.lowLatencyOffset, TryCand, Cand, Depth))
+  if (tryLess(TryCand.hasLowLatencyNonWaitedParent, Cand.hasLowLatencyNonWaitedParent, TryCand, Cand, Depth))
     return;
+
+  if (Cand.SGPRUsage > 60 && tryLess(TryCand.SGPRUsage, Cand.SGPRUsage, TryCand, Cand, RegUsage))
+    return;
+
   if (tryGreater(TryCand.isLowLatency, Cand.isLowLatency, TryCand, Cand, Depth))
+    return;
+
+  if (TryCand.isLowLatency &&
+      tryLess(TryCand.lowLatencyOffset, Cand.lowLatencyOffset, TryCand, Cand, Depth))
     return;
 
   if (tryLess(TryCand.VGPRUsage, Cand.VGPRUsage, TryCand, Cand, RegUsage))
@@ -170,37 +178,8 @@ void SIBlockSchedule::tryCandidateTopDown(SISchedCandidate &Cand,
   }
 }
 
-void SIBlockSchedule::tryCandidateBottomUp(SISchedCandidate &Cand,
-                                           SISchedCandidate &TryCand) {
-  // Initialize the candidate if needed.
-  if (!Cand.isValid()) {
-    TryCand.Reason = NodeOrder;
-    return;
-  }
-
-  // Schedule low latency instructions as top as possible
-  if (tryLess(TryCand.isLowLatency, Cand.isLowLatency, TryCand, Cand, Depth))
-    return;
-  if (tryGreater(TryCand.lowLatencyOffset, Cand.lowLatencyOffset, TryCand, Cand, Depth))
-    return;
-
-  if (tryLess(TryCand.VGPRUsage, Cand.VGPRUsage, TryCand, Cand, RegUsage))
-    return;
-
-  // Encourage depth traversal
-  if (tryLess(TryCand.SU->getDepth(), Cand.SU->getDepth(), TryCand, Cand, Depth))
-    return;
-
-  // Fall through to original instruction order.
-  if (TryCand.SU->NodeNum > Cand.SU->NodeNum) {
-    TryCand.Reason = NodeOrder;
-  }
-}
-
-SUnit* SIBlockSchedule::pickNode(bool TopOnly, bool &isTop) {
+SUnit* SIBlockSchedule::pickNode() {
   SISchedCandidate TopCand;
-  SISchedCandidate BotCand;
-  unsigned BaseLatReg, OffLatReg;
 
   for (std::vector<SUnit*>::iterator I = TopReadySUs.begin(), E = TopReadySUs.end(); I != E; ++I) {
     SISchedCandidate TryCand;
@@ -208,12 +187,11 @@ SUnit* SIBlockSchedule::pickNode(bool TopOnly, bool &isTop) {
     std::vector<unsigned> MaxPressure = TopRPTracker.getRegSetPressureAtPos();
     TopRPTracker.getDownwardPressure((*I)->getInstr(), pressure, MaxPressure);
     TryCand.SU = *I;
+    TryCand.SGPRUsage = pressure[12];
     TryCand.VGPRUsage = pressure[26];
-    TryCand.isLowLatency = DAG->SITII->isLowLatencyInstruction(TryCand.SU->getInstr());
-    TryCand.lowLatencyOffset = 0;
-    if (TryCand.isLowLatency && DAG->SITII->getLdStBaseRegImmOfs(TryCand.SU->getInstr(), BaseLatReg, OffLatReg, DAG->getTRI())) {
-      TryCand.lowLatencyOffset = OffLatReg;
-    }
+    TryCand.isLowLatency = DAG->isLowlatencySU[(*I)->NodeNum];
+    TryCand.lowLatencyOffset = DAG->LowLatencyOffset[(*I)->NodeNum];
+    TryCand.hasLowLatencyNonWaitedParent = DAG->hasLowLatencyNonWaitedParent[(*I)->NodeNum];
     tryCandidateTopDown(TopCand, TryCand);
     if (TryCand.Reason != NoCand) {
       TopCand.setBest(TryCand);
@@ -221,31 +199,7 @@ SUnit* SIBlockSchedule::pickNode(bool TopOnly, bool &isTop) {
     }
   }
 
-  if (TopOnly) {
-    isTop = true;
-    return TopCand.SU;
-  }
-
-  for (std::vector<SUnit*>::iterator I = BottomReadySUs.begin(), E = BottomReadySUs.end(); I != E; ++I) {
-    SISchedCandidate TryCand;
-    std::vector<unsigned> pressure = BotRPTracker.getRegSetPressureAtPos();
-    std::vector<unsigned> MaxPressure = BotRPTracker.getRegSetPressureAtPos();
-    BotRPTracker.getUpwardPressure((*I)->getInstr(), pressure, MaxPressure);
-    TryCand.SU = *I;
-    TryCand.VGPRUsage = pressure[26];
-    TryCand.isLowLatency = DAG->SITII->isLowLatencyInstruction(TryCand.SU->getInstr());
-    TryCand.lowLatencyOffset = 0;
-    if (TryCand.isLowLatency && DAG->SITII->getLdStBaseRegImmOfs(TryCand.SU->getInstr(), BaseLatReg, OffLatReg, DAG->getTRI())) {
-      TryCand.lowLatencyOffset = OffLatReg;
-    }
-    tryCandidateBottomUp(BotCand, TryCand);
-    if (TryCand.Reason != NoCand) {
-      BotCand.setBest(TryCand);
-    }
-  }
-  // TODO: if one reduce reg usage, and not the other, take it, else take bottom
-  isTop = false;
-  return BotCand.SU;
+  return TopCand.SU;
 }
 
 
@@ -253,13 +207,9 @@ SUnit* SIBlockSchedule::pickNode(bool TopOnly, bool &isTop) {
 // goal is just to be able to compute LiveIns and LiveOuts
 void SIBlockSchedule::fastSchedule() {
   TopReadySUs.clear();
-  BottomReadySUs.clear();
 
   for (unsigned i = 0, e = (unsigned)SUnits.size(); i != e; ++i) {
     SUnit *SU = SUnits[i];
-
-    if (!SU->NumSuccsLeft)
-      BottomReadySUs.push_back(SU);
 
     if (!SU->NumPredsLeft)
       TopReadySUs.push_back(SU);
@@ -356,7 +306,6 @@ void SIBlockSchedule::initRegPressure(MachineBasicBlock::iterator BeginBlock, Ma
 }
 
 void SIBlockSchedule::schedule(MachineBasicBlock::iterator BeginBlock, MachineBasicBlock::iterator EndBlock) {
-  std::vector<SUnit*> LowLatencyReadySUs;
   std::vector<SUnit*> ScheduledSUnitsBottom;
 
   if (!scheduled)
@@ -369,66 +318,19 @@ void SIBlockSchedule::schedule(MachineBasicBlock::iterator BeginBlock, MachineBa
   // Schedule for real now
 
   TopReadySUs.clear();
-  BottomReadySUs.clear();
 
   for (unsigned i = 0, e = (unsigned)SUnits.size(); i != e; ++i) {
     SUnit *SU = SUnits[i];
 
-    if (!SU->NumSuccsLeft)
-      BottomReadySUs.push_back(SU);
-
-    if (SU->NumPredsLeft)
-      continue;
-
-    if (DAG->SITII->isLowLatencyInstruction(SU->getInstr()) && SU->NumSuccsLeft)
-      LowLatencyReadySUs.push_back(SU);
-    else
+    if (!SU->NumPredsLeft)
       TopReadySUs.push_back(SU);
   }
 
-  // TODO: choose best order for low latency SU
-  for (unsigned i = 0, e = (unsigned)LowLatencyReadySUs.size(); i != e; ++i) {
-    SUnit *SU = LowLatencyReadySUs[i];
+  while (!TopReadySUs.empty()) {
+    SUnit *SU = pickNode();
     ScheduledSUnits.push_back(SU);
     TopRPTracker.setPos(SU->getInstr());
     TopRPTracker.advance();
-  }
-
-  // Schedule Top down what can be scheduled
-  if (LowLatencyReadySUs.size()) {
-    while (!TopReadySUs.empty()) {
-      bool isTop;
-      SUnit *SU = pickNode(true, isTop);
-      assert(isTop);
-      ScheduledSUnits.push_back(SU);
-      TopRPTracker.setPos(SU->getInstr());
-      TopRPTracker.advance();
-      NodeScheduled(SU);
-    }
-  }
-
-  // Release low latency successors only now
-  for (unsigned i = 0, e = (unsigned)LowLatencyReadySUs.size(); i != e; ++i) {
-    SUnit *SU = LowLatencyReadySUs[i];
-    releaseSuccessors(SU, true);
-    SU->isScheduled = true;
-  }
-
-  // Schedule the remaining Bottom Up (mainly)
-  while (!TopReadySUs.empty()) {
-    bool isTop;
-    SUnit *SU = pickNode(false, isTop);
-    if (isTop) {
-      ScheduledSUnits.push_back(SU);
-      TopRPTracker.setPos(SU->getInstr());
-      TopRPTracker.advance();
-    } else {
-      ScheduledSUnitsBottom.push_back(SU);
-      MachineBasicBlock::const_iterator Pos = SU->getInstr();
-      Pos ++;
-      BotRPTracker.setPos(Pos);
-      BotRPTracker.recede();
-    }
     NodeScheduled(SU);
   }
 
@@ -445,12 +347,11 @@ void SIBlockSchedule::schedule(MachineBasicBlock::iterator BeginBlock, MachineBa
   // Check everything is right
 #ifndef NDEBUG
   assert(SUnits.size() == ScheduledSUnits.size());
-  assert(TopReadySUs.empty() && BottomReadySUs.empty());
+  assert(TopReadySUs.empty());
   for (unsigned i = 0, e = (unsigned)ScheduledSUnits.size(); i != e; ++i) {
     SUnit *SU = SUnits[i];
     assert (SU->isScheduled);
     assert (SU->NumPredsLeft == 0);
-    assert (SU->NumSuccsLeft == 0);
   }
 #endif
 
@@ -517,59 +418,21 @@ void SIBlockSchedule::releaseSuccessors(SUnit *SU, bool InOrOutBlock) {
   }
 }
 
-void SIBlockSchedule::releasePred(SUnit *SU, SDep *PredEdge, bool InOrOutBlock) {
-  SUnit *PredSU = PredEdge->getSUnit();
-
-  if (DAG->isSUInBlock(PredSU, ID) != InOrOutBlock)
-    return;
-
-  if (PredEdge->isWeak()) {
-    --PredSU->WeakSuccsLeft;
-    return;
-  }
-#ifndef NDEBUG
-  if (PredSU->NumSuccsLeft == 0) {
-    dbgs() << "*** Scheduling failed! ***\n";
-    PredSU->dump(DAG);
-    dbgs() << " has been released too many times!\n";
-    llvm_unreachable(nullptr);
-  }
-#endif
-
-  --PredSU->NumSuccsLeft;
-  if (PredSU->NumSuccsLeft == 0 && InOrOutBlock && !PredSU->isScheduled)
-    BottomReadySUs.push_back(PredSU);
-}
-
-/// Release Predecessors of the SU that are in the block  or not
-void SIBlockSchedule::releasePredecessors(SUnit *SU, bool InOrOutBlock) {
-  for (SUnit::pred_iterator I = SU->Preds.begin(), E = SU->Preds.end();
-       I != E; ++I) {
-    releasePred(SU, &*I, InOrOutBlock);
-  }
-}
-
 void SIBlockSchedule::NodeScheduled(SUnit *SU) {
   /* Is in TopReadySUs */
-  if (!SU->NumPredsLeft) {
-    std::vector<SUnit*>::iterator I = std::find(TopReadySUs.begin(), TopReadySUs.end(), SU);
-    if (I == TopReadySUs.end()) {
-      dbgs() << "Data Structure Bug in SI Scheduler\n";
-      llvm_unreachable(nullptr);
-    }
-    TopReadySUs.erase(I);
+  assert (!SU->NumPredsLeft);
+  std::vector<SUnit*>::iterator I = std::find(TopReadySUs.begin(), TopReadySUs.end(), SU);
+  if (I == TopReadySUs.end()) {
+    dbgs() << "Data Structure Bug in SI Scheduler\n";
+    llvm_unreachable(nullptr);
   }
-  /* Is in BottomReadySUs */
-  if (!SU->NumSuccsLeft) {
-    std::vector<SUnit*>::iterator I = std::find(BottomReadySUs.begin(), BottomReadySUs.end(), SU);
-    if (I == BottomReadySUs.end()) {
-      dbgs() << "Data Structure Bug in SI Scheduler\n";
-      llvm_unreachable(nullptr);
-    }
-    BottomReadySUs.erase(I);
-  }
+  TopReadySUs.erase(I);
+
   releaseSuccessors(SU, true);
-  releasePredecessors(SU, true);
+  // scheduling this node will trigger a wait, thus propagate to other instructions they do not need to wait either
+  if (DAG->hasLowLatencyNonWaitedParent[SU->NodeNum]) {
+    DAG->propagateWaitedLatencies();
+  }
   SU->isScheduled = true;
 }
 
@@ -990,7 +853,9 @@ void SIScheduleDAGMI::createBlocks() {
     if (Colors[SU->NodeNum] <= maxHighLatencyID && Colors[SU->NodeNum] > 0)
       continue;
 
-    if (Colors_FirstPass[SU->NodeNum] > 0 || SU->Preds.size() > 0)
+    /* No predecessor: vgpr constant loading */
+    /* low latency instruction usually have a predecessor (the address) */
+    if (Colors_FirstPass[SU->NodeNum] > 0 || (SU->Preds.size() > 0 && !SITII->isLowLatencyInstruction(SU->getInstr())))
       continue;
 
     for (SUnit::const_succ_iterator I = SU->Succs.begin(), E = SU->Succs.end();
@@ -1153,7 +1018,6 @@ void SIScheduleDAGMI::createBlocks() {
     SUnit *SU = &SUnits[i];
     unsigned color = Colors[SU->NodeNum];
     Blocks[RealID[color]]->releaseSuccessors(SU, false);
-    Blocks[RealID[color]]->releasePredecessors(SU, false);
   }
   DEBUG(dbgs() << "Blocks created:\n\n");
   DEBUG(
@@ -1188,8 +1052,43 @@ nextIfDebug(MachineBasicBlock::iterator I,
       &*nextIfDebug(MachineBasicBlock::const_iterator(I), End)));
 }
 
+void SIScheduleDAGMI::propagateWaitedLatencies() {
+  unsigned DAGSize = Blocks.size();
+
+  for (unsigned i = 0, e = (unsigned)SUnits.size(); i != e; ++i) {
+    SUnit *SU = &SUnits[i];
+
+    hasLowLatencyNonWaitedParent[i] = 0;
+
+    for (SUnit::succ_iterator I = SU->Preds.begin(), E = SU->Preds.end();
+         I != E; ++I) {
+      SUnit *Pred = I->getSUnit();
+      if (Pred->NodeNum >= DAGSize || Pred->isScheduled)
+        continue;
+      if (SITII->isLowLatencyInstruction(Pred->getInstr()))
+        hasLowLatencyNonWaitedParent[i] = 1;
+    }
+  }
+}
+
 void SIScheduleDAGMI::scheduleInsideBlocks() {
+  unsigned DAGSize = Blocks.size();
+  std::vector<int> WorkList;
+  std::vector<int> TopDownIndex2Indice;
+  std::vector<int> TopDownIndice2Index;
+
   DEBUG(dbgs() << "\nScheduling Blocks\n\n");
+
+  // fill some stats to help scheduling (dummy stats for fastSchedule)
+
+  isLowlatencySU.clear();
+  LowLatencyOffset.clear();
+  hasLowLatencyNonWaitedParent.clear();
+
+  isLowlatencySU.resize(SUnits.size());
+  LowLatencyOffset.resize(SUnits.size());
+  hasLowLatencyNonWaitedParent.resize(SUnits.size());
+
   // We do schedule a valid scheduling such that a Block corresponds
   // to a range of instructions. That will guarantee that if a result
   // produced inside the Block, but also used inside the Block, while it
@@ -1200,11 +1099,6 @@ void SIScheduleDAGMI::scheduleInsideBlocks() {
     SIBlockSchedule *Block = Blocks[i].get();
     Block->fastSchedule();
   }
-
-  unsigned DAGSize = Blocks.size();
-  std::vector<int> WorkList;
-  std::vector<int> TopDownIndex2Indice;
-  std::vector<int> TopDownIndice2Index;
 
   WorkList.reserve(DAGSize);
 
@@ -1235,7 +1129,7 @@ void SIScheduleDAGMI::scheduleInsideBlocks() {
     }
   }
 
-  #ifndef NDEBUG
+#ifndef NDEBUG
   // Check correctness of the ordering
   for (unsigned i = 0, e = DAGSize; i != e; ++i) {
     SIBlockSchedule *Block = Blocks[i].get();
@@ -1274,6 +1168,38 @@ void SIScheduleDAGMI::scheduleInsideBlocks() {
         LIS->handleMove(MI, /*UpdateFlags=*/true);
         PosNew.push_back(CurrentTopFastSched);
       }
+    }
+  }
+
+  // fill some stats to help scheduling
+
+  isLowlatencySU.clear();
+  LowLatencyOffset.clear();
+  hasLowLatencyNonWaitedParent.clear();
+
+  isLowlatencySU.resize(SUnits.size());
+  LowLatencyOffset.resize(SUnits.size());
+  hasLowLatencyNonWaitedParent.resize(SUnits.size());
+  
+  for (unsigned i = 0, e = (unsigned)SUnits.size(); i != e; ++i) {
+    SUnit *SU = &SUnits[i];
+    unsigned BaseLatReg, OffLatReg;
+    if (SITII->isLowLatencyInstruction(SU->getInstr())) {
+      isLowlatencySU[i] = 1;
+      if (SITII->getLdStBaseRegImmOfs(SU->getInstr(), BaseLatReg, OffLatReg, TRI))
+        LowLatencyOffset[i] = OffLatReg;
+    }
+  }
+
+  for (unsigned i = 0, e = (unsigned)SUnits.size(); i != e; ++i) {
+    SUnit *SU = &SUnits[i];
+    for (SUnit::succ_iterator I = SU->Preds.begin(), E = SU->Preds.end();
+         I != E; ++I) {
+      SUnit *Pred = I->getSUnit();
+      if (Pred->NodeNum >= DAGSize)
+        continue;
+      if (SITII->isLowLatencyInstruction(Pred->getInstr()))
+        hasLowLatencyNonWaitedParent[i] = 1;
     }
   }
 
@@ -1330,17 +1256,17 @@ void SIScheduleDAGMI::moveLowLatencies() {
    unsigned DAGSize = SUnits.size();
    int last_low_latency_user = -1;
    int last_low_latency_pos = -1;
-  // TODO: form groups
-  // Move low latencies sooner
+
    for (unsigned i = 0, e = ScheduledSUnits.size(); i != e; ++i) {
     SUnit *SU = &SUnits[ScheduledSUnits[i]];
+    bool isLowLatencyUser = false;
     unsigned MinPos = 0;
 
     for (SUnit::const_pred_iterator I = SU->Preds.begin(), E = SU->Preds.end();
          I != E; ++I) {
       SUnit *Pred = I->getSUnit();
       if (SITII->isLowLatencyInstruction(Pred->getInstr())) {
-        last_low_latency_user = i;
+        isLowLatencyUser = true;
       }
       if (Pred->NodeNum >= DAGSize)
         continue;
@@ -1351,8 +1277,6 @@ void SIScheduleDAGMI::moveLowLatencies() {
 
     if (SITII->isLowLatencyInstruction(SU->getInstr())) {
       unsigned BestPos = last_low_latency_user + 1;
-      if (BestPos > i) // instruction is user of low latency too
-        BestPos = i;
       if ((int)BestPos <= last_low_latency_pos)
         BestPos = last_low_latency_pos + 1;
       if (BestPos < MinPos)
@@ -1366,7 +1290,10 @@ void SIScheduleDAGMI::moveLowLatencies() {
         ScheduledSUnitsInv[SU->NodeNum] = BestPos;
       }
       last_low_latency_pos = BestPos;
-    }
+      if (isLowLatencyUser)
+        last_low_latency_user = BestPos;
+    } else if (isLowLatencyUser)
+      last_low_latency_user = i;
   }
 }
 
@@ -1719,7 +1646,7 @@ void SIScheduleDAGMI::scheduleWithVariant(SIScheduleVariant variant)
   DEBUG(dbgs() << score << "\n\n");
 
   DEBUG(dbgs() << "Optimising\n");
-  improveSchedule();
+  //improveSchedule();
   DEBUG(
     dbgs() << "Block Order:";
     for (unsigned i = 0, e = BlockScheduleOrder.size(); i != e; ++i) {
@@ -1948,7 +1875,7 @@ void SIScheduleDAGMI::schedule()
   bestVariantScore = -1.;
   bestBlockScheduleOrder.clear();
 
-  for (unsigned v = LatencyOnlyTopDown; v <= ReguseLatencyTopDown/*LatencyReguseDeepSearchBottomUp*/; v++) {
+  for (unsigned v = LatencyOnlyTopDown; v <=  LatencyOnlyTopDown/*ReguseLatencyTopDown*//*LatencyReguseDeepSearchBottomUp*/; v++) {
     scheduleWithVariant(SIScheduleVariant(v));
   }
 
