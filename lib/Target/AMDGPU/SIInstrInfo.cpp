@@ -2804,3 +2804,16 @@ uint64_t SIInstrInfo::getScratchRsrcWords23() const {
 
   return Rsrc23;
 }
+
+bool SIInstrInfo::isLowLatencyInstruction(const MachineInstr *MI) const {
+  unsigned Opc = MI->getOpcode();
+
+  return isSMRD(Opc);
+}
+
+bool SIInstrInfo::isHighLatencyInstruction(const MachineInstr *MI) const {
+  unsigned Opc = MI->getOpcode();
+
+  return isMUBUF(Opc) || isMTBUF(Opc) || isMIMG(Opc);
+}
+

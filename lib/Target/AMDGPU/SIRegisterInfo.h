@@ -24,6 +24,12 @@ namespace llvm {
 
 struct SIRegisterInfo : public AMDGPURegisterInfo {
 private:
+  unsigned SGPRsForWaveFronts[10];
+  unsigned SGPRsForWaveFrontsVI[10];
+  unsigned VGPRsForWaveFronts[10];
+  unsigned SGPR32SetID;
+  unsigned VGPR32SetID;
+
   void reserveRegisterTuples(BitVector &, unsigned Reg) const;
 
 public:
@@ -119,6 +125,16 @@ public:
 
   unsigned findUnusedRegister(const MachineRegisterInfo &MRI,
                               const TargetRegisterClass *RC) const;
+
+  unsigned getSGPR32PressureSet() const { return SGPR32SetID;};
+  unsigned getVGPR32PressureSet() const { return VGPR32SetID;};
+
+  unsigned getWaveFrontsForUsage(AMDGPUSubtarget::Generation gen,
+                                 unsigned SGPRsUsed,
+                                 unsigned VGPRsUsed) const;
+  unsigned spillCost(AMDGPUSubtarget::Generation gen,
+                     unsigned SGPRsUsed,
+                     unsigned VGPRsUsed) const;
 
 private:
   void buildScratchLoadStore(MachineBasicBlock::iterator MI,
