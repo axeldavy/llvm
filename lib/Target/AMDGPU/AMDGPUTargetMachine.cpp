@@ -21,10 +21,12 @@
 #include "R600MachineScheduler.h"
 #include "SIISelLowering.h"
 #include "SIInstrInfo.h"
+#include "SIMachineScheduler.h"
 #include "llvm/Analysis/Passes.h"
 #include "llvm/CodeGen/MachineFunctionAnalysis.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
+#include "llvm/CodeGen/MachineScheduler.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/MC/MCAsmInfo.h"
@@ -47,9 +49,17 @@ static ScheduleDAGInstrs *createR600MachineScheduler(MachineSchedContext *C) {
   return new ScheduleDAGMILive(C, make_unique<R600SchedStrategy>());
 }
 
+static ScheduleDAGInstrs *createSIMachineScheduler(MachineSchedContext *C) {
+  return new SIScheduleDAGMI(C);
+}
+
 static MachineSchedRegistry
-SchedCustomRegistry("r600", "Run R600's custom scheduler",
-                    createR600MachineScheduler);
+R600SchedRegistry("r600", "Run R600's custom scheduler",
+                   createR600MachineScheduler);
+
+static MachineSchedRegistry
+SISchedRegistry("si", "Run SI's custom scheduler",
+                createSIMachineScheduler);
 
 static std::string computeDataLayout(const Triple &TT) {
   std::string Ret = "e-p:32:32";
@@ -121,6 +131,8 @@ public:
     const AMDGPUSubtarget &ST = *getAMDGPUTargetMachine().getSubtargetImpl();
     if (ST.getGeneration() <= AMDGPUSubtarget::NORTHERN_ISLANDS)
       return createR600MachineScheduler(C);
+    //else //(uncomment to turn default for SI)
+    //  return createSIMachineScheduler(C);
     return nullptr;
   }
 

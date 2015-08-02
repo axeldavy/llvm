@@ -119,6 +119,9 @@ struct SIRegisterInfo : public AMDGPURegisterInfo {
   unsigned findUnusedRegister(const MachineRegisterInfo &MRI,
                               const TargetRegisterClass *RC) const;
 
+  unsigned getSGPR32PressureSet() const;
+  unsigned getVGPR32PressureSet() const;
+
 private:
   void buildScratchLoadStore(MachineBasicBlock::iterator MI,
                              unsigned LoadStoreOp, unsigned Value,

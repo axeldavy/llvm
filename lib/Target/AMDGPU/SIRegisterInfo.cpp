@@ -540,3 +540,19 @@ unsigned SIRegisterInfo::getNumSGPRsAllowed(AMDGPUSubtarget::Generation gen,
     }
   }
 }
+
+unsigned SIRegisterInfo::getSGPR32PressureSet() const {
+  for (unsigned i = 0; i < getNumRegPressureSets(); ++i) {
+    if (strncmp("SGPR_32", getRegPressureSetName(i), 7) == 0)
+      return i;
+  }
+  llvm_unreachable(nullptr);
+}
+
+unsigned SIRegisterInfo::getVGPR32PressureSet() const {
+  for (unsigned i = 0; i < getNumRegPressureSets(); ++i) {
+    if (strncmp("VGPR_32", getRegPressureSetName(i), 7) == 0)
+      return i;
+  }
+  llvm_unreachable(nullptr);
+}
