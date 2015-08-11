@@ -2113,6 +2113,8 @@ def : Pat <
   (S_BUFFER_LOAD_DWORD_SGPR $sbase, $offset)
 >;
 
+let Predicates = [isSICI] in {
+
 // Two optimisations for gallium nine:
 
 // max(log(x), FP_MIN) -> log_clamp(x). This is not correct if x is INF, but do we care ?
@@ -2130,6 +2132,8 @@ def : Pat <
 >;
 
 } // End Predicates = [isSICI]
+
+let Predicates = [isCI] in {
 
 def : Pat <
   (SIload_constant v4i32:$sbase, (SMRDBufferImm32 i32:$offset)),
