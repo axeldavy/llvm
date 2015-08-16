@@ -2630,6 +2630,11 @@ void GenericScheduler::tryCandidate(SchedCandidate &Cand,
     TryCand.Reason = NodeOrder;
     return;
   }
+  if ((Zone.isTop() && TryCand.SU->NodeNum < Cand.SU->NodeNum)
+      || (!Zone.isTop() && TryCand.SU->NodeNum > Cand.SU->NodeNum)) {
+    TryCand.Reason = NodeOrder;
+  return;
+  }
 
   if (tryGreater(biasPhysRegCopy(TryCand.SU, Zone.isTop()),
                  biasPhysRegCopy(Cand.SU, Zone.isTop()),
