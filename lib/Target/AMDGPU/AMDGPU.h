@@ -46,6 +46,7 @@ FunctionPass *createSILowerControlFlowPass(TargetMachine &tm);
 FunctionPass *createSIFixControlFlowLiveIntervalsPass();
 FunctionPass *createSIFixSGPRCopiesPass(TargetMachine &tm);
 FunctionPass *createSIFixSGPRLiveRangesPass();
+FunctionPass *createSIExtendSGPRLiveRangesPass();
 FunctionPass *createSICodeEmitterPass(formatted_raw_ostream &OS);
 FunctionPass *createSIInsertWaits(TargetMachine &tm);
 FunctionPass *createSIPrepareScratchRegs();
@@ -72,6 +73,8 @@ extern char &SIFixControlFlowLiveIntervalsID;
 void initializeSIFixSGPRLiveRangesPass(PassRegistry&);
 extern char &SIFixSGPRLiveRangesID;
 
+void initializeSIExtendSGPRLiveRangesPass(PassRegistry&);
+extern char &SIExtendSGPRLiveRangesID;
 
 extern Target TheAMDGPUTarget;
 extern Target TheGCNTarget;

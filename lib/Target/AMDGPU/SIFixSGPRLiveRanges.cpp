@@ -87,6 +87,8 @@ public:
     AU.addPreserved<MachinePostDominatorTree>();
     AU.setPreservesCFG();
 
+    //AU.setPreservesAll();
+
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 };

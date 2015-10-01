@@ -324,6 +324,7 @@ void GCNPassConfig::addOptimizedRegAlloc(FunctionPass *RegAllocPass) {
   // FIXME: We shouldn't disable the verifier here. r249087 introduced a failure
   // that needs to be fixed.
   insertPass(&LiveVariablesID, &SIFixSGPRLiveRangesID, /*VerifyAfter=*/false);
+  //addPass(createSIExtendSGPRLiveRangesPass());
   TargetPassConfig::addOptimizedRegAlloc(RegAllocPass);
 }
 
