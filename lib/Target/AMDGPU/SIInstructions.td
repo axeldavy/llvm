@@ -70,6 +70,8 @@ defm S_LOAD_DWORDX4 : SMRD_Helper <smrd<0x02>, "s_load_dwordx4", SReg_64, SReg_1
 defm S_LOAD_DWORDX8 : SMRD_Helper <smrd<0x03>, "s_load_dwordx8", SReg_64, SReg_256>;
 defm S_LOAD_DWORDX16 : SMRD_Helper <smrd<0x04>, "s_load_dwordx16", SReg_64, SReg_512>;
 
+let isReMaterializable = 1 in {
+
 defm S_BUFFER_LOAD_DWORD : SMRD_Helper <
   smrd<0x08>, "s_buffer_load_dword", SReg_128, SGPR_32
 >;
@@ -89,6 +91,8 @@ defm S_BUFFER_LOAD_DWORDX8 : SMRD_Helper <
 defm S_BUFFER_LOAD_DWORDX16 : SMRD_Helper <
   smrd<0x0c>, "s_buffer_load_dwordx16", SReg_128, SReg_512
 >;
+
+} // isReMaterializable = 1
 
 } // mayLoad = 1
 
