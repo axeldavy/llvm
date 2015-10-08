@@ -278,7 +278,7 @@ void SIInsertWaits::pushInstruction(MachineBasicBlock &MBB,
     // and destination registers don't overlap, e.g. this is illegal:
     //   r0 = load r2
     //   r2 = load r0
-    if ((LastOpcodeType == SMEM && TII->isSMRD(I->getOpcode())) ||
+    if (/*(LastOpcodeType == SMEM && TII->isSMRD(I->getOpcode())) ||*/
         (LastOpcodeType == VMEM && Increment.Named.VM)) {
       // Insert a NOP to break the clause.
       BuildMI(MBB, I, DebugLoc(), TII->get(AMDGPU::S_NOP))

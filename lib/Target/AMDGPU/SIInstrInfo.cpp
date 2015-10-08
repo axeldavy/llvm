@@ -83,9 +83,12 @@ bool SIInstrInfo::isReallyTriviallyReMaterializable(const MachineInstr *MI,
   case AMDGPU::V_MOV_B32_e32:
   case AMDGPU::V_MOV_B32_e64:
   case AMDGPU::V_MOV_B64_PSEUDO:
+    return true;
   // TODO: VI can write to kcache. We should check there is no write to kcache.
   case AMDGPU::S_BUFFER_LOAD_DWORD_IMM:
   case AMDGPU::S_BUFFER_LOAD_DWORD_IMM_ci:
+    if (MI->mayLoad() && !MI->isInvariantLoad(AA))
+    return false;
     return true;
   default:
     return false;
