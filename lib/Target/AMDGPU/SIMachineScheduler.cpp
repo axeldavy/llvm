@@ -627,6 +627,8 @@ bool SIScheduleBlockCreator::isSUInBlock(SUnit *SU, unsigned ID) {
 // Does a topological sort over the SUs.
 // Both TopDown and BottomUp
 void SIScheduleBlockCreator::topologicalSort() {
+  // Node2Index - Maps the node number to its topological index.
+  std::vector<int> TopDownNode2Index;
   unsigned DAGSize = DAG->SUnits.size();
   std::vector<SUnit*> WorkList;
 
@@ -636,7 +638,6 @@ void SIScheduleBlockCreator::topologicalSort() {
   TopDownIndex2Node.resize(DAGSize);
   TopDownNode2Index.resize(DAGSize);
   BottomUpIndex2Node.resize(DAGSize);
-  BottomUpNode2Index.resize(DAGSize);
 
   WorkList.push_back(&DAG->getExitSU());
   for (unsigned i = 0, e = DAGSize; i != e; ++i) {
@@ -665,34 +666,8 @@ void SIScheduleBlockCreator::topologicalSort() {
     }
   }
 
-  WorkList.clear();
+  BottomUpIndex2Node = std::vector<int>(TopDownIndex2Node.rbegin(), TopDownIndex2Node.rend());
 
-  WorkList.push_back(&DAG->getEntrySU());
-  for (int i = DAGSize - 1; i >= 0; --i) {
-    SUnit *SU = &DAG->SUnits[i];
-    int NodeNum = SU->NodeNum;
-    unsigned Degree = SU->Preds.size();
-    BottomUpNode2Index[NodeNum] = Degree;
-    if (Degree == 0) {
-      assert(SU->Preds.empty() && "SUnit should have no successors");
-      WorkList.push_back(SU);
-    }
-  }
-
-  Id = DAGSize;
-  while (!WorkList.empty()) {
-    SUnit *SU = WorkList.back();
-    WorkList.pop_back();
-    if (SU->NodeNum < DAGSize) {
-      BottomUpNode2Index[SU->NodeNum] = --Id;
-      BottomUpIndex2Node[Id] = SU->NodeNum;
-    }
-    for (SDep& Succ : SU->Succs) {
-      SUnit *SU = Succ.getSUnit();
-      if (SU->NodeNum < DAGSize && !--BottomUpNode2Index[SU->NodeNum])
-        WorkList.push_back(SU);
-    }
-  }
 #ifndef NDEBUG
   // Check correctness of the ordering
   for (unsigned i = 0, e = DAGSize; i != e; ++i) {
@@ -710,8 +685,8 @@ void SIScheduleBlockCreator::topologicalSort() {
     for (SDep& Succ : SU->Succs) {
       if (Succ.getSUnit()->NodeNum >= DAGSize)
         continue;
-      assert(BottomUpNode2Index[SU->NodeNum] >
-             BottomUpNode2Index[Succ.getSUnit()->NodeNum] &&
+      assert(TopDownNode2Index[SU->NodeNum] <
+             TopDownNode2Index[Succ.getSUnit()->NodeNum] &&
              "Wrong Bottom Up topological sorting");
     }
   }
@@ -795,7 +770,7 @@ void SIScheduleBlockCreator::colorComputeReservedDependencies() {
       continue;
     }
 
-   for (SDep& SuccDep : SU->Succs) {
+    for (SDep& SuccDep : SU->Succs) {
       SUnit *Succ = SuccDep.getSUnit();
       if (SuccDep.isWeak() || Succ->NodeNum >= DAGSize)
         continue;
@@ -850,8 +825,73 @@ void SIScheduleBlockCreator::colorAccordingToReservedDependencies() {
   }
 }
 
+void SIScheduleBlockCreator::colorEndsAccordingToDependencies() {
+  unsigned DAGSize = DAG->SUnits.size();
+  std::vector<int> PendingColoring = CurrentColoring;
+
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &DAG->SUnits[BottomUpIndex2Node[i]];
+    std::set<unsigned> SUColors;
+    std::set<unsigned> SUColorsPending;
+
+    if (CurrentColoring[SU->NodeNum] <= (int)DAGSize)
+      continue;
+
+    if (CurrentBottomUpReservedDependencyColoring[SU->NodeNum] > 0 ||
+        CurrentTopDownReservedDependencyColoring[SU->NodeNum] > 0)
+      continue;
+
+    for (SDep& SuccDep : SU->Succs) {
+      SUnit *Succ = SuccDep.getSUnit();
+      if (SuccDep.isWeak() || Succ->NodeNum >= DAGSize)
+        continue;
+      if (CurrentBottomUpReservedDependencyColoring[Succ->NodeNum] > 0 ||
+          CurrentTopDownReservedDependencyColoring[Succ->NodeNum] > 0)
+        SUColors.insert(CurrentColoring[Succ->NodeNum]);
+      SUColorsPending.insert(PendingColoring[Succ->NodeNum]);
+    }
+    if (SUColors.size() == 1 && SUColorsPending.size() == 1)
+      PendingColoring[SU->NodeNum] = *SUColors.begin();
+    else/* if (SUColors.size() == SUColorsPending.size())
+      PendingColoring[SU->NodeNum] = NextNonReservedID++; /l*TODO: check combi *l/
+    else if (SUColorsPending.size() > SUColors.size())*/
+      PendingColoring[SU->NodeNum] = NextNonReservedID++; /*TODO: check combi */
+  }
+  CurrentColoring = PendingColoring;
+}
+
+
 void SIScheduleBlockCreator::colorForceConsecutiveOrderInGroup() {
-  llvm_unreachable("Not yet Implemented");
+  unsigned DAGSize = DAG->SUnits.size();
+  unsigned PreviousColor;
+  std::set<unsigned> SeenColors;
+
+  if (DAGSize <= 1)
+    return;
+
+  PreviousColor = CurrentColoring[0];
+
+  for (unsigned i = 1, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &DAG->SUnits[i];
+    unsigned CurrentColor = CurrentColoring[i];
+    unsigned PreviousColorSave = PreviousColor;
+    assert(i == SU->NodeNum);
+
+    if (CurrentColor != PreviousColor)
+      SeenColors.insert(PreviousColor);
+    PreviousColor = CurrentColor;
+
+    if (CurrentColoring[SU->NodeNum] <= (int)DAGSize)
+      continue;
+
+    if (SeenColors.find(CurrentColor) == SeenColors.end())
+      continue;
+
+    if (PreviousColorSave != CurrentColor)
+      CurrentColoring[i] = NextNonReservedID++;
+    else
+      CurrentColoring[i] = CurrentColoring[i-1];      
+  }
 }
 
 void SIScheduleBlockCreator::colorMergeConstantLoadsNextGroup() {
@@ -922,6 +962,68 @@ void SIScheduleBlockCreator::colorMergeIfPossibleNextGroupOnlyForReserved() {
   }
 }
 
+void SIScheduleBlockCreator::colorMergeIfPossibleSmallGroupsToNextGroup() {
+  unsigned DAGSize = DAG->SUnits.size();
+  std::map<unsigned, unsigned> ColorCount;
+
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &DAG->SUnits[BottomUpIndex2Node[i]];
+    unsigned color = CurrentColoring[SU->NodeNum];
+    std::map<unsigned, unsigned>::iterator Pos = ColorCount.find(color);
+      if (Pos != ColorCount.end()) {
+        ++ColorCount[color];
+      } else {
+        ColorCount[color] = 1;
+      }
+  }
+
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &DAG->SUnits[BottomUpIndex2Node[i]];
+    unsigned color = CurrentColoring[SU->NodeNum];
+    std::set<unsigned> SUColors;
+
+    if (CurrentColoring[SU->NodeNum] <= (int)DAGSize)
+      continue;
+
+    if (ColorCount[color] > 1)
+      continue;
+
+    for (SDep& SuccDep : SU->Succs) {
+       SUnit *Succ = SuccDep.getSUnit();
+      if (SuccDep.isWeak() || Succ->NodeNum >= DAGSize)
+        continue;
+      SUColors.insert(CurrentColoring[Succ->NodeNum]);
+    }
+    if (SUColors.size() == 1 && *SUColors.begin() != color) {
+      --ColorCount[color];
+      CurrentColoring[SU->NodeNum] = *SUColors.begin();
+      ++ColorCount[*SUColors.begin()];
+    }
+  }
+}
+
+void SIScheduleBlockCreator::regroupNoUserInstructions() {
+  unsigned DAGSize = DAG->SUnits.size();
+  int GroupID = NextNonReservedID++;
+
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &DAG->SUnits[BottomUpIndex2Node[i]];
+    bool hasSuccessor = false;
+
+    if (CurrentColoring[SU->NodeNum] <= (int)DAGSize)
+      continue;
+
+    for (SDep& SuccDep : SU->Succs) {
+       SUnit *Succ = SuccDep.getSUnit();
+      if (SuccDep.isWeak() || Succ->NodeNum >= DAGSize)
+        continue;
+      hasSuccessor = true;
+    }
+    if (!hasSuccessor)
+      CurrentColoring[SU->NodeNum] = GroupID;
+  }
+}
+
 void SIScheduleBlockCreator::createBlocksForVariant(SISchedulerBlockCreatorVariant BlockVariant) {
   unsigned DAGSize = DAG->SUnits.size();
   std::map<unsigned,unsigned> RealID;
@@ -942,8 +1044,12 @@ void SIScheduleBlockCreator::createBlocksForVariant(SISchedulerBlockCreatorVaria
     colorHighLatenciesAlone();
     colorComputeReservedDependencies();
     colorAccordingToReservedDependencies();
+    colorEndsAccordingToDependencies();
+    //colorForceConsecutiveOrderInGroup();
     colorMergeConstantLoadsNextGroup();
     colorMergeIfPossibleNextGroupOnlyForReserved();
+    regroupNoUserInstructions();
+    //colorMergeIfPossibleSmallGroupsToNextGroup();
   } else
     llvm_unreachable(nullptr);
 
@@ -1150,23 +1256,100 @@ SIScheduleBlockScheduler::SIScheduleBlockScheduler(SIScheduleDAGMI *DAG,
                                                    std::vector<SIScheduleBlock*> Blocks) :
   DAG(DAG), Variant(Variant), Blocks(Blocks), NumBlockScheduled(0), maxVregUsage(0), maxSregUsage(0) {
   // Fill the usage of every output
-  // By construction we have that for every Reg input
-  // of a block, it is present one time max in the outputs
-  // of its Block predecessors. If it is not, it means it Reads
-  // a register whose content was already filled at start
+  // Warning: while by construction we always have a link between two blocks
+  // when one needs a result from the other, the number of users of an output
+  // is not the sum of child blocks having as input the same virtual register.
+  // Here is an example. A produces x and y. B eats x and produces x'.
+  // C eats x' and y. The register coalescer may have attributed the same
+  // virtual register to x and x'.
+  // To count accurately, we do a topological sort in case the register is found
+  // for several parents, we increment the usage of the one with the highest topological
+  // index
+
+  unsigned DAGSize = Blocks.size();
+  std::vector<int> WorkList;
+  std::vector<int> TopDownIndex2Indice;
+  std::vector<int> TopDownIndice2Index;
+
+  DEBUG(dbgs() << "\nScheduling Blocks\n\n");
+
+  // We do schedule a valid scheduling such that a Block corresponds
+  // to a range of instructions. That will guarantee that if a result
+  // produced inside the Block, but also used inside the Block, while it
+  // gets used in another Block, then it will be correctly counted in the
+  // Live Output Regs of the Block
+  DEBUG(dbgs() << "First phase: Fast scheduling for Reg Liveness\n");
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SIScheduleBlock *Block = Blocks[i];
+    Block->fastSchedule();
+  }
+
+  WorkList.reserve(DAGSize);
+
+  TopDownIndex2Indice.resize(DAGSize);
+  TopDownIndice2Index.resize(DAGSize);
+
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SIScheduleBlock *Block = Blocks[i];
+    unsigned Degree = Block->Succs.size();
+    TopDownIndice2Index[i] = Degree;
+    if (Degree == 0) {
+      WorkList.push_back(i);
+    }
+  }
+
+  int Id = DAGSize;
+  while (!WorkList.empty()) {
+    int i = WorkList.back();
+    SIScheduleBlock *Block = Blocks[i];
+    WorkList.pop_back();
+    TopDownIndice2Index[i] = --Id;
+    TopDownIndex2Indice[Id] = i;
+    for (SIScheduleBlock* Pred : Block->Preds) {
+      if (!--TopDownIndice2Index[Pred->ID])
+        WorkList.push_back(Pred->ID);
+    }
+  }
+
+#ifndef NDEBUG
+  // Check correctness of the ordering
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SIScheduleBlock *Block = Blocks[i];
+    for (SIScheduleBlock* Pred : Block->Preds) {
+      assert(TopDownIndice2Index[i] > TopDownIndice2Index[Pred->ID] &&
+      "Wrong Top Down topological sorting");
+    }
+  }
+#endif
+
   LiveOutRegsNumUsages.resize(Blocks.size());
   for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
     SIScheduleBlock *Block = Blocks[i];
     for (unsigned Reg : Block->getInRegs()) {
-      for (SIScheduleBlock* Pred : Block->Preds) {
-        std::map<unsigned, unsigned>::iterator RegPos =
-          LiveOutRegsNumUsages[Pred->ID].find(Reg);
-        if (RegPos != LiveOutRegsNumUsages[Pred->ID].end()) {
-          ++LiveOutRegsNumUsages[Pred->ID][Reg];
-          break;
-        } else {
-          LiveOutRegsNumUsages[Pred->ID][Reg] = 1;
+      bool Found = false;
+      int topoInd = -1;
+      for (SIScheduleBlock* Pred: Block->Preds) {
+        std::set<unsigned> PredOutRegs = Pred->getOutRegs();
+        std::set<unsigned>::iterator RegPos = PredOutRegs.find(Reg);
+
+        if (RegPos != PredOutRegs.end()) {
+          Found = true;
+          if (topoInd < TopDownIndice2Index[Pred->ID]) {
+            topoInd = TopDownIndice2Index[Pred->ID];
+          }
         }
+      }
+
+      if (!Found)
+        continue;
+
+      int PredID = TopDownIndex2Indice[topoInd];
+      std::map<unsigned, unsigned>::iterator RegPos =
+        LiveOutRegsNumUsages[PredID].find(Reg);
+      if (RegPos != LiveOutRegsNumUsages[PredID].end()) {
+        ++LiveOutRegsNumUsages[PredID][Reg];
+      } else {
+        LiveOutRegsNumUsages[PredID][Reg] = 1;
       }
     }
   }
@@ -1266,6 +1449,10 @@ void SIScheduleBlockScheduler::tryCandidate(SIBlockSchedCandidate &Cand,
   if (tryLess(TryCand.VGPRUsageDiff, Cand.VGPRUsageDiff,
               TryCand, Cand, RegUsage))
     return;
+  if (tryGreater(TryCand.NumSuccessors > 0,
+                 Cand.NumSuccessors > 0,
+                 TryCand, Cand, Successor))
+    return;
 }
 
 SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
@@ -1302,6 +1489,7 @@ SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
     TryCand.VGPRUsageDiff =
       checkRegUsageImpact(TryCand.Block->getInRegs(),
                           TryCand.Block->getOutRegs())[DAG->VGPRSetID];
+    TryCand.NumSuccessors = TryCand.Block->Succs.size();
     TryCand.NumHighLatencySuccessors = TryCand.Block->NumHighLatencySuccessors;
     TryCand.LastPosHighLatParentScheduled =
       LastPosHighLatencyParentScheduled[TryCand.Block->ID];
@@ -1376,8 +1564,10 @@ void SIScheduleBlockScheduler::blockScheduled(SIScheduleBlock *Block) {
     std::pair<unsigned, unsigned> RegP = *RegI;
     if (LiveRegsConsumers.find(RegP.first) == LiveRegsConsumers.end())
       LiveRegsConsumers[RegP.first] = RegP.second;
-    else
+    else {
+      assert(LiveRegsConsumers[RegP.first] == 0);
       LiveRegsConsumers[RegP.first] += RegP.second;
+    }
   }
   ++NumBlockScheduled;
 }

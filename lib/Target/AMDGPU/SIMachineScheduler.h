@@ -197,12 +197,9 @@ class SIScheduleBlockCreator {
   std::vector<int> Node2CurrentBlock;
 
   /// Topological sort
-  /// Index2Node - Maps topological index to the node number.
+  /// Maps topological index to the node number.
   std::vector<int> TopDownIndex2Node;
   std::vector<int> BottomUpIndex2Node;
-  /// Node2Index - Maps the node number to its topological index.
-  std::vector<int> TopDownNode2Index;
-  std::vector<int> BottomUpNode2Index;
 
   // 0 -> color not given
   // 1 to SUnits.size() -> Reserved group (you should only add elements to them)
@@ -238,6 +235,11 @@ private:
   // Gives Color to all non-colored SUs according to Reserved groups dependencies
   void colorAccordingToReservedDependencies();
 
+  // SUs not depending on any Reserved group and on which no Reserved group depend
+  // are put into the same group with colorAccordingToReservedDependencies.
+  // Separates these SUs by coloring depending on the already given colors
+  void colorEndsAccordingToDependencies();
+
   // Cut groups into groups with SUs in consecutive order (except for Reserved groups)
   void colorForceConsecutiveOrderInGroup();
 
@@ -250,6 +252,16 @@ private:
 
   // Merge SUs that have all their users into another group to the group, but only for Reserved groups
   void colorMergeIfPossibleNextGroupOnlyForReserved();
+
+  // Merge SUs that have all their users into another group to the group, but only if the group
+  // is no more than a few SUs
+  void colorMergeIfPossibleSmallGroupsToNextGroup();
+
+  // Break into pieces Blocks with important size
+  void cutHugeBlocks();
+
+  // Put in one group all instructions with no users in this scheduling region (we'd want these groups be at the end)
+  void regroupNoUserInstructions();
 
   void createBlocksForVariant(SISchedulerBlockCreatorVariant BlockVariant);
 
@@ -307,6 +319,7 @@ private:
 
     bool IsHighLatency;
     int VGPRUsageDiff;
+    unsigned NumSuccessors;
     unsigned NumHighLatencySuccessors;
     unsigned LastPosHighLatParentScheduled;
 
@@ -322,6 +335,7 @@ private:
       Reason = Best.Reason;
       IsHighLatency = Best.IsHighLatency;
       VGPRUsageDiff = Best.VGPRUsageDiff;
+      NumSuccessors = Best.NumSuccessors;
       NumHighLatencySuccessors = Best.NumHighLatencySuccessors;
       LastPosHighLatParentScheduled = Best.LastPosHighLatParentScheduled;
     }
