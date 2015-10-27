@@ -705,53 +705,7 @@ void SIScheduleBlockCreator::colorHighLatenciesAlone() {
 }
 
 void SIScheduleBlockCreator::colorHighLatenciesGroups() {
-  unsigned DAGSize = DAG->SUnits.size();
-  unsigned NumHighLatencies = 0;
-  unsigned GroupSize;
-  unsigned Color = NextReservedID;
-  unsigned Count = 0;
-  std::set<unsigned> FormingGroup;
-
-  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
-    SUnit *SU = &DAG->SUnits[i];
-    if (DAG->IsHighLatencySU[SU->NodeNum])
-      ++NumHighLatencies;
-  }
-
-  if (NumHighLatencies == 0)
-    return;
-
-  if (NumHighLatencies <= 6)
-    GroupSize = 2;
-  else if (NumHighLatencies <= 12)
-    GroupSize = 3;
-  else
-    GroupSize = 4;
-
-  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
-    SUnit *SU = &DAG->SUnits[i];
-    if (DAG->IsHighLatencySU[SU->NodeNum]) {
-      unsigned CompatibleGroup = true;
-      unsigned ProposedColor = Color;
-      for (unsigned j : FormingGroup) {
-        if (!DAG->canAddEdge(SU, &DAG->SUnits[j]) ||
-            !DAG->canAddEdge(&DAG->SUnits[j], SU))
-          CompatibleGroup = false;
-      }
-      if (!CompatibleGroup || ++Count == GroupSize) {
-        FormingGroup.clear();
-        Color = ++NextReservedID;
-        if (!CompatibleGroup) {
-          ProposedColor = Color;
-          FormingGroup.insert(SU->NodeNum);
-        }
-        Count = 0;
-      } else {
-        FormingGroup.insert(SU->NodeNum);
-      }
-      CurrentColoring[SU->NodeNum] = ProposedColor;
-    }
-  }
+  llvm_unreachable("Not yet Implemented");
 }
 
 void SIScheduleBlockCreator::colorComputeReservedDependencies() {
@@ -1087,8 +1041,7 @@ void SIScheduleBlockCreator::createBlocksForVariant(SISchedulerBlockCreatorVaria
   DEBUG(dbgs() << "Coloring the graph\n");
 
   if (BlockVariant == SISchedulerBlockCreatorVariant::LatenciesAlone) {
-    //colorHighLatenciesAlone();
-    colorHighLatenciesGroups();
+    colorHighLatenciesAlone();
     colorComputeReservedDependencies();
     colorAccordingToReservedDependencies();
     colorEndsAccordingToDependencies();
@@ -1798,7 +1751,6 @@ void SIScheduleDAGMI::schedule()
        SU.dumpAll(this)
   );
 
-  Topo.InitDAGTopologicalSorting();
   findRootsAndBiasEdges(TopRoots, BotRoots);
   // We reuse several ScheduleDAGMI and ScheduleDAGMILive
   // functions, but to make them happy we must initialize
