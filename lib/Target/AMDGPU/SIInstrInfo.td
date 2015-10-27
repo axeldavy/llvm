@@ -2624,7 +2624,7 @@ class MIMG_NoSampler_Helper <bits<7> op, string asm,
      #" $tfe, $lwe, $slc, $vaddr, $srsrc",
   []> {
   let ssamp = 0;
-  let mayLoad = 1;
+  let mayLoad = 0;
   let mayStore = 0;
   let hasPostISelHook = 1;
 }
@@ -2658,7 +2658,7 @@ class MIMG_Sampler_Helper <bits<7> op, string asm,
   asm#" $vdata, $dmask, $unorm, $glc, $da, $r128,"
      #" $tfe, $lwe, $slc, $vaddr, $srsrc, $ssamp",
   []> {
-  let mayLoad = 1;
+  let mayLoad = 0;
   let mayStore = 0;
   let hasPostISelHook = 1;
   let WQM = wqm;
@@ -2704,7 +2704,7 @@ class MIMG_Gather_Helper <bits<7> op, string asm,
   asm#" $vdata, $dmask, $unorm, $glc, $da, $r128,"
      #" $tfe, $lwe, $slc, $vaddr, $srsrc, $ssamp",
   []> {
-  let mayLoad = 1;
+  let mayLoad = 0;
   let mayStore = 0;
 
   // DMASK was repurposed for GATHER4. 4 components are always
