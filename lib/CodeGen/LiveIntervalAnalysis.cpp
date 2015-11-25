@@ -1040,6 +1040,11 @@ private:
   /// 5. Value read at OldIdx, killed before NewIdx:
   ///    Extend kill to NewIdx.
   ///
+  /// 6. Live def at OldIdx AND several other values between NewIdx and OldIdx
+  ///    Merge the range that contains OldIdx with the preceding one and split
+  ///    the range that contains NewIdx.
+  ///    (Happens when reordering independent writes to a subregister)
+  ///
   void handleMoveDown(LiveRange &LR) {
     // First look for a kill at OldIdx.
     LiveRange::iterator I = LR.find(OldIdx.getBaseIndex());
@@ -1050,10 +1055,22 @@ private:
 
     // Handle a live-in value.
     if (!SlotIndex::isSameInstr(I->start, OldIdx)) {
-      bool isKill = SlotIndex::isSameInstr(OldIdx, I->end);
       // If the live-in value already extends to NewIdx, there is nothing to do.
       if (!SlotIndex::isEarlierInstr(I->end, NewIdx))
         return;
+      // We may move a use across a definition (that definition may define an
+      // unrelated subregister).
+      // Check if we need to extend the destination interval.
+      LiveRange::iterator Next = std::next(I);
+      if (Next != E && !SlotIndex::isSameInstr(OldIdx, Next->start) &&
+          SlotIndex::isEarlierInstr(Next->start, NewIdx)) {
+        LiveInterval::iterator NewI = LR.advanceTo(I, NewIdx.getBaseIndex());
+        if (NewI != E && SlotIndex::isEarlierInstr(NewI->start, NewIdx))
+          return;
+        LiveInterval::iterator Prev = std::prev(NewI);
+        Prev->end = NewIdx.getRegSlot();
+        return;
+      }
       // Aggressively remove all kill flags from the old kill point.
       // Kill flags shouldn't be used while live intervals exist, they will be
       // reinserted by VirtRegRewriter.
@@ -1063,9 +1080,10 @@ private:
             MO->setIsKill(false);
       // Adjust I->end to reach NewIdx. This may temporarily make LR invalid by
       // overlapping ranges. Case 5 above.
+      bool IsKill = SlotIndex::isSameInstr(OldIdx, I->end);
       I->end = NewIdx.getRegSlot(I->end.isEarlyClobber());
       // If this was a kill, there may also be a def. Otherwise we're done.
-      if (!isKill)
+      if (!IsKill)
         return;
       ++I;
     }
@@ -1073,25 +1091,89 @@ private:
     // Check for a def at OldIdx.
     if (I == E || !SlotIndex::isSameInstr(OldIdx, I->start))
       return;
-    // We have a def at OldIdx.
+    // We have a def at OldIdx, prepare to move it to NewIdx.
     VNInfo *DefVNI = I->valno;
     assert(DefVNI->def == I->start && "Inconsistent def");
-    DefVNI->def = NewIdx.getRegSlot(I->start.isEarlyClobber());
+    const SlotIndex NewIdxDef = NewIdx.getRegSlot(I->start.isEarlyClobber());
+    DefVNI->def = NewIdxDef;
     // If the defined value extends beyond NewIdx, just move the def down.
     // This is case 1 above.
-    if (SlotIndex::isEarlierInstr(NewIdx, I->end)) {
-      I->start = DefVNI->def;
+    if (SlotIndex::isEarlierInstr(NewIdxDef, I->end)) {
+      I->start = NewIdxDef;
       return;
     }
     // The remaining possibilities are now:
     // 2. Live def at OldIdx, killed at NewIdx: isSameInstr(I->end, NewIdx).
     // 3. Dead def at OldIdx: I->end = OldIdx.getDeadSlot().
+    // 6. Live def at OldIdx moving accross several others values
     // In either case, it is possible that there is an existing def at NewIdx.
-    assert((I->end == OldIdx.getDeadSlot() ||
-            SlotIndex::isSameInstr(I->end, NewIdx)) &&
-            "Cannot move def below kill");
-    LiveRange::iterator NewI = LR.advanceTo(I, NewIdx.getRegSlot());
-    if (NewI != E && SlotIndex::isSameInstr(NewI->start, NewIdx)) {
+    LiveRange::iterator NewI = LR.advanceTo(I, NewIdxDef);
+    bool IsDeadDef = SlotIndex::isSameInstr(I->start, I->end);
+    if (!IsDeadDef && SlotIndex::isEarlierInstr(I->end, NewIdxDef)) {
+      // OldIdx is not a dead def, and NewIdxDef is inside a new interval.
+      // Case 6 above.
+      LiveRange::iterator IPrev = std::prev(I);
+      if (I != LR.begin() && !SlotIndex::isEarlierInstr(IPrev->end, I->start)) {
+        // There is no gap between I and its predecessor anymore, merge them
+        DefVNI = I->valno;
+        IPrev->end = I->end;
+      } else {
+        // The live intervals look like (where I = [xi+2,xi+3) ) :
+        // [x0,x1)...[xi,xi+1)[xi+2,xi+3)...
+        // The value is live in in I
+        LiveRange::iterator INext = std::next(I);
+        assert(INext != E && "Must have following segment");
+        // We merge I and its successor. As we're dealing with subreg
+        // reordering, there is always a successor to I in the same BB
+        // We don't need INext->valno anymore and will reuse for the new segment
+        // we create later.
+        DefVNI = INext->valno;
+        INext->start = I->end;
+        INext->valno = I->valno;
+        INext->valno->def = INext->start;
+      }
+      // If NewIdx is behind the last segment, extend that and append a new one.
+      if (NewI == E) {
+        // I is undef at this point, Slide (I;NewI] up one position.
+        std::copy(std::next(I), NewI, I);
+        // The last segment is undefined now, reuse it for a dead def.
+        NewI = std::prev(NewI);
+        NewI->start = NewIdxDef;
+        NewI->end = NewIdxDef.getDeadSlot();
+        NewI->valno = DefVNI;
+        NewI->valno->def = NewI->start;
+
+        LiveRange::iterator Prev = std::prev(NewI);
+        Prev->end = NewIdxDef;
+      } else {
+        // I is undef at this point, Slide (I;NewI] up one position.
+        std::copy(std::next(I), std::next(NewI), I);
+        LiveRange::iterator Prev = std::prev(NewI);
+        // We have two cases:
+        if (SlotIndex::isEarlierInstr(Prev->start, NewIdxDef)) {
+          // Case 1: NewIdx is inside a liverange. Split this liverange at
+          // NewIdxDef into the segment "Prev" followed by "NewI".
+          NewI->start = NewIdxDef;
+          NewI->end = Prev->end;
+          NewI->valno = Prev->valno;
+          NewI->valno->def = NewIdxDef;
+          Prev->end = NewIdxDef;
+          Prev->valno = DefVNI;
+          Prev->valno->def = Prev->start;
+        } else {
+          // Case 2: NewIdx is in a lifetime hole. Keep NewI as is and turn
+          // Prev into a segment from NewIdx to NewI->start.
+          Prev->start = NewIdxDef;
+          Prev->end = NewI->start;
+          Prev->valno = DefVNI;
+          Prev->valno->def = NewIdxDef;
+          assert(DefVNI != NewI->valno);
+        }
+      }
+      return;
+    }
+
+    if (NewI != E && SlotIndex::isSameInstr(NewI->start, NewIdxDef)) {
       // There is an existing def at NewIdx, case 4 above. The def at OldIdx is
       // coalesced into that value.
       assert(NewI->valno != DefVNI && "Multiple defs of value?");
@@ -1105,7 +1187,7 @@ private:
     assert(NewI != I && "Inconsistent iterators");
     std::copy(std::next(I), NewI, I);
     *std::prev(NewI)
-      = LiveRange::Segment(DefVNI->def, NewIdx.getDeadSlot(), DefVNI);
+      = LiveRange::Segment(DefVNI->def, NewIdxDef.getDeadSlot(), DefVNI);
   }
 
   /// Update LR to reflect an instruction has been moved upwards from OldIdx
@@ -1128,6 +1210,11 @@ private:
   ///    Hoist kill to NewIdx, then scan for last kill between NewIdx and
   ///    OldIdx.
   ///
+  /// 6. Live def at OldIdx AND several other values between NewIdx and OldIdx
+  ///    Extend the range that precedes OldIdx one and split the range that
+  ///    contains NewIdx.
+  ///    (Happens when reordering independent partial write to a register)
+  ///
   void handleMoveUp(LiveRange &LR, unsigned Reg, LaneBitmask LaneMask) {
     // First look for a kill at OldIdx.
     LiveRange::iterator I = LR.find(OldIdx.getBaseIndex());
@@ -1136,22 +1223,23 @@ private:
     if (I == E || SlotIndex::isEarlierInstr(OldIdx, I->start))
       return;
 
-    // Handle a live-in value.
+    // Is the value alive immediately before OldIdx?
     if (!SlotIndex::isSameInstr(I->start, OldIdx)) {
-      // If the live-in value isn't killed here, there is nothing to do.
+      // If the segment ends later, then we have a non-killing use and are fine.
       if (!SlotIndex::isSameInstr(OldIdx, I->end))
         return;
-      // Adjust I->end to end at NewIdx. If we are hoisting a kill above
-      // another use, we need to search for that use. Case 5 above.
-      I->end = NewIdx.getRegSlot(I->end.isEarlyClobber());
-      ++I;
-      // If OldIdx also defines a value, there couldn't have been another use.
-      if (I == E || !SlotIndex::isSameInstr(I->start, OldIdx)) {
-        // No def, search for the new kill.
-        // This can never be an early clobber kill since there is no def.
-        std::prev(I)->end = findLastUseBefore(Reg, LaneMask).getRegSlot();
-        return;
+      LiveRange::iterator Next = std::next(I);
+      bool IsReDef = Next != E && SlotIndex::isSameInstr(OldIdx, Next->start);
+      // If OldIdx is not a redef or a dead-redef then we move the killing use
+      // around and have to search backwards for the new kill. Case 5 above.
+      I->end = std::max(I->start.getDeadSlot(), NewIdx.getRegSlot());
+      if (!IsReDef || SlotIndex::isSameInstr(Next->start, Next->end)) {
+        I->end = findLastUseBefore(I->end, Reg, LaneMask);
+        // We are done if it was just a use.
+        if (!IsReDef)
+          return;
       }
+      I = Next;
     }
 
     // Now deal with the def at OldIdx.
@@ -1173,6 +1261,40 @@ private:
       // Case 4: Replace def at NewIdx with live def at OldIdx.
       I->start = DefVNI->def;
       LR.removeValNo(NewI->valno);
+      return;
+    }
+
+    bool IsDeadDef = SlotIndex::isSameInstr(I->start, I->end);
+    if (!IsDeadDef && I != LR.begin() &&
+        SlotIndex::isEarlierInstr(NewIdx, std::prev(I)->start)) {
+      // Case 6:
+      // OldIdx is not a dead def and NewIdx is before predecessor start
+      LiveInterval::iterator NewI = LR.find(NewIdx.getRegSlot(true));
+      const SlotIndex SplitPos = DefVNI->def;
+      // We merge I and I predecessor's
+      LiveRange::iterator Prev = std::prev(I);
+      I->start = Prev->start;
+      I->valno = Prev->valno;
+      // I predecessor's is now undef
+      // We Slide [NewI, Prev) down one position.
+      std::copy_backward(NewI, Prev, I);
+      // NewI is now considered undef so we can reuse it for the moved value.
+      NewI->valno = DefVNI;
+      LiveRange::iterator Next = std::next(NewI);
+      if (SlotIndex::isEarlierInstr(Next->start, NewIdx)) {
+        // There is no gap between NewI and its predecessor
+        NewI->start = Next->start;
+        NewI->end = SplitPos;
+        NewI->valno->def = NewI->start;
+        Next->start = SplitPos;
+        Next->valno->def = SplitPos;
+      } else {
+        // There is a gap between NewI and its predecessor
+        // Value become live in
+        NewI->start = SplitPos;
+        NewI->end = Next->start;
+        NewI->valno->def = SplitPos;
+      }
       return;
     }
 
@@ -1205,10 +1327,10 @@ private:
   }
 
   // Return the last use of reg between NewIdx and OldIdx.
-  SlotIndex findLastUseBefore(unsigned Reg, LaneBitmask LaneMask) {
-
+  SlotIndex findLastUseBefore(SlotIndex Before, unsigned Reg,
+                              LaneBitmask LaneMask) {
     if (TargetRegisterInfo::isVirtualRegister(Reg)) {
-      SlotIndex LastUse = NewIdx;
+      SlotIndex LastUse = Before;
       for (MachineOperand &MO : MRI.use_nodbg_operands(Reg)) {
         unsigned SubReg = MO.getSubReg();
         if (SubReg != 0 && LaneMask != 0
@@ -1218,16 +1340,16 @@ private:
         const MachineInstr *MI = MO.getParent();
         SlotIndex InstSlot = LIS.getSlotIndexes()->getInstructionIndex(MI);
         if (InstSlot > LastUse && InstSlot < OldIdx)
-          LastUse = InstSlot;
+          LastUse = InstSlot.getRegSlot();
       }
       return LastUse;
     }
 
     // This is a regunit interval, so scanning the use list could be very
     // expensive. Scan upwards from OldIdx instead.
-    assert(NewIdx < OldIdx && "Expected upwards move");
+    assert(Before < OldIdx && "Expected upwards move");
     SlotIndexes *Indexes = LIS.getSlotIndexes();
-    MachineBasicBlock *MBB = Indexes->getMBBFromIndex(NewIdx);
+    MachineBasicBlock *MBB = Indexes->getMBBFromIndex(Before);
 
     // OldIdx may not correspond to an instruction any longer, so set MII to
     // point to the next instruction after OldIdx, or MBB->end().
@@ -1243,19 +1365,19 @@ private:
         continue;
       SlotIndex Idx = Indexes->getInstructionIndex(MII);
 
-      // Stop searching when NewIdx is reached.
-      if (!SlotIndex::isEarlierInstr(NewIdx, Idx))
-        return NewIdx;
+      // Stop searching when Before is reached.
+      if (!SlotIndex::isEarlierInstr(Before, Idx))
+        return Before;
 
       // Check if MII uses Reg.
       for (MIBundleOperands MO(MII); MO.isValid(); ++MO)
         if (MO->isReg() &&
             TargetRegisterInfo::isPhysicalRegister(MO->getReg()) &&
             TRI.hasRegUnit(MO->getReg(), Reg))
-          return Idx;
+          return Idx.getRegSlot();
     }
-    // Didn't reach NewIdx. It must be the first instruction in the block.
-    return NewIdx;
+    // Didn't reach Before. It must be the first instruction in the block.
+    return Before;
   }
 };
 
