@@ -305,7 +305,28 @@ class SIScheduleBlockScheduler {
   // Num of schedulable unscheduled blocks reading the register.
   std::map<unsigned, unsigned> LiveRegsConsumers;
 
+  // Position in the final schedule of the last high latency parent
   std::vector<unsigned> LastPosHighLatencyParentScheduled;
+  // Maximum height of the -not yet scheduled- parents
+  std::vector<unsigned> MaxHeightUnscheduledParent;
+  // Number of -not yet scheduled- parents, that cannot be
+  // immediately scheduled either.
+  std::vector<unsigned> NumParentsUnschedulable;
+  // Number of -not yet scheduled- parents, that can be
+  // scheduled immediately
+  std::vector<unsigned> NumParentsSchedulable;
+  // Number of successors that could be scheduled
+  // immediately after this block
+  std::vector<unsigned> NumReadySuccessors;
+  // Number of successors this block is the not yet scheduled parent
+  // with max height.
+  std::vector<unsigned> NumTopHeightParentSuccessors;
+  // Number of successors that cannot be scheduled immediately
+  // after this block, but which depends only on blocks
+  // that can be scheduled immediately
+  std::vector<unsigned> NumSoonSchedulableSuccessors;
+  // whether a block is scheduled or not
+  std::vector<bool> IsScheduled;
 
   std::vector<SIScheduleBlock*> BlocksScheduled;
   unsigned NumBlockScheduled;
@@ -343,6 +364,9 @@ private:
     unsigned NumHighLatencySuccessors;
     unsigned LastPosHighLatParentScheduled;
     unsigned Height;
+    unsigned ReadySuccessors;
+    unsigned TopHeightParentSuccessors;
+    unsigned SoonSchedulableSuccessors;
 
     SIBlockSchedCandidate()
       : Block(nullptr) {}
@@ -360,6 +384,9 @@ private:
       NumHighLatencySuccessors = Best.NumHighLatencySuccessors;
       LastPosHighLatParentScheduled = Best.LastPosHighLatParentScheduled;
       Height = Best.Height;
+      ReadySuccessors = Best.ReadySuccessors;
+      TopHeightParentSuccessors = Best.TopHeightParentSuccessors;
+      SoonSchedulableSuccessors = Best.SoonSchedulableSuccessors;
     }
   };
 
@@ -367,6 +394,9 @@ private:
                            SIBlockSchedCandidate &TryCand);
   bool tryCandidateRegUsage(SIBlockSchedCandidate &Cand,
                             SIBlockSchedCandidate &TryCand);
+  // Try to find a path of length maxNumBlock maximum, that uses less than MaxTargetVGPR vgprs,
+  // and reduces Register usage (or if not possible uses the less possible).
+  std::vector<SIScheduleBlock *> findGoodRegUsagePath(unsigned MaxTargetVGPR, unsigned maxNumBlock);
   SIScheduleBlock *pickBlock();
 
   void addLiveRegs(std::set<unsigned> &Regs);

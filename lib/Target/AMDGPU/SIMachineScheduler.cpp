@@ -1454,7 +1454,19 @@ SIScheduleBlockScheduler::SIScheduleBlockScheduler(SIScheduleDAGMI *DAG,
   }
 #endif
 
+  // fill statistics
   LiveOutRegsNumUsages.resize(Blocks.size());
+  LastPosHighLatencyParentScheduled.resize(Blocks.size(), 0);
+  MaxHeightUnscheduledParent.resize(Blocks.size(), 0);
+  NumParentsUnschedulable.resize(Blocks.size(), 0);
+  NumParentsSchedulable.resize(Blocks.size(), 0);
+  NumReadySuccessors.resize(Blocks.size(), 0);
+  NumTopHeightParentSuccessors.resize(Blocks.size(), 0);
+  NumSoonSchedulableSuccessors.resize(Blocks.size(), 0);
+  IsScheduled.resize(Blocks.size(), false);
+  BlockNumPredsLeft.resize(Blocks.size());
+  BlockNumSuccsLeft.resize(Blocks.size());
+
   for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
     SIScheduleBlock *Block = Blocks[i];
     for (unsigned Reg : Block->getInRegs()) {
@@ -1486,23 +1498,6 @@ SIScheduleBlockScheduler::SIScheduleBlockScheduler(SIScheduleDAGMI *DAG,
     }
   }
 
-  LastPosHighLatencyParentScheduled.resize(Blocks.size(), 0);
-  BlockNumPredsLeft.resize(Blocks.size());
-  BlockNumSuccsLeft.resize(Blocks.size());
-
-  for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
-    SIScheduleBlock *Block = Blocks[i];
-    BlockNumPredsLeft[i] = Block->Preds.size();
-    BlockNumSuccsLeft[i] = Block->Succs.size();
-  }
-
-#ifndef NDEBUG
-  for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
-    SIScheduleBlock *Block = Blocks[i];
-    assert(Block->ID == i);
-  }
-#endif
-
   std::set<unsigned> InRegs = DAG->getInRegs();
   addLiveRegs(InRegs);
 
@@ -1531,6 +1526,49 @@ SIScheduleBlockScheduler::SIScheduleBlockScheduler(SIScheduleDAGMI *DAG,
     }
   }
 
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    int BlockIndice = TopDownIndex2Indice[i];
+    SIScheduleBlock *Block = Blocks[BlockIndice];
+    bool IsSchedulable = Block->Preds.size() == 0;
+    unsigned Height = Block->Height;
+    for (SIScheduleBlock *Succ : Block->Succs) {
+      if (Height > MaxHeightUnscheduledParent[Succ->ID])
+        MaxHeightUnscheduledParent[Succ->ID] = Height;
+      if (IsSchedulable)
+        NumParentsSchedulable[Succ->ID]++;
+      else
+        NumParentsUnschedulable[Succ->ID]++;
+    }
+  }
+
+  for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
+    SIScheduleBlock *Block = Blocks[i];
+    unsigned Height = Block->Height;
+    for (SIScheduleBlock *Succ : Block->Succs) {
+      if (NumParentsUnschedulable[Succ->ID] == 0) {
+        if (NumParentsSchedulable[Succ->ID] == 1)
+          NumReadySuccessors[Block->ID]++;
+        else
+          NumSoonSchedulableSuccessors[Block->ID]++;
+      }
+      if (MaxHeightUnscheduledParent[Succ->ID] == Height)
+        NumTopHeightParentSuccessors[Block->ID]++;
+    }
+  }
+
+  for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
+    SIScheduleBlock *Block = Blocks[i];
+    BlockNumPredsLeft[i] = Block->Preds.size();
+    BlockNumSuccsLeft[i] = Block->Succs.size();
+  }
+
+#ifndef NDEBUG
+  for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
+    SIScheduleBlock *Block = Blocks[i];
+    assert(Block->ID == i);
+  }
+#endif
+
   for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
     SIScheduleBlock *Block = Blocks[i];
     if (BlockNumPredsLeft[i] == 0) {
@@ -1538,9 +1576,15 @@ SIScheduleBlockScheduler::SIScheduleBlockScheduler(SIScheduleDAGMI *DAG,
     }
   }
 
-  while (SIScheduleBlock *Block = pickBlock()) {
-    BlocksScheduled.push_back(Block);
-    blockScheduled(Block);
+  // schedule
+  //while (SIScheduleBlock *Block = pickBlock()) {
+  //  BlocksScheduled.push_back(Block);
+  //  blockScheduled(Block);
+  //}
+
+  std::vector<SIScheduleBlock *> Bl = findGoodRegUsagePath(0,0);
+  while (Bl.size() != 0) {
+    Bl = findGoodRegUsagePath(0,0);
   }
 
   DEBUG(
@@ -1557,6 +1601,13 @@ bool SIScheduleBlockScheduler::tryCandidateLatency(SIBlockSchedCandidate &Cand,
     TryCand.Reason = NodeOrder;
     return true;
   }
+
+  // Do no use blocks of few instruction, which do increase register usage and have
+  // no ready successors, to hide latencies. Instead schedule them as late as possible.
+  if (tryLess(TryCand.Block->getCost() <= 3 && TryCand.ReadySuccessors == 0 &&
+              TryCand.VGPRUsageDiff > 0 && !TryCand.IsHighLatency,
+              Cand.Block->getCost() <= 1 && Cand.ReadySuccessors == 0 &&
+              Cand.VGPRUsageDiff > 0 && !Cand.IsHighLatency, TryCand, Cand, RegUsage))
 
   // Try to hide high latencies
   if (tryLess(TryCand.LastPosHighLatParentScheduled,
@@ -1585,6 +1636,17 @@ bool SIScheduleBlockScheduler::tryCandidateRegUsage(SIBlockSchedCandidate &Cand,
   if (tryLess(TryCand.VGPRUsageDiff > 0, Cand.VGPRUsageDiff > 0,
               TryCand, Cand, RegUsage))
     return true;
+  if (tryGreater(TryCand.ReadySuccessors > 0, Cand.ReadySuccessors > 0,
+                 TryCand, Cand, Successor))
+    return true;
+  /*if (tryGreater(TryCand.TopHeightParentSuccessors,
+                 Cand.TopHeightParentSuccessors,
+                 TryCand, Cand, Successor))
+    return true;*/
+  if (tryGreater(TryCand.SoonSchedulableSuccessors > 0,
+                 Cand.SoonSchedulableSuccessors > 0,
+                 TryCand, Cand, Successor))
+    return true;
   if (tryGreater(TryCand.NumSuccessors > 0,
                  Cand.NumSuccessors > 0,
                  TryCand, Cand, Successor))
@@ -1595,6 +1657,117 @@ bool SIScheduleBlockScheduler::tryCandidateRegUsage(SIBlockSchedCandidate &Cand,
               TryCand, Cand, RegUsage))
     return true;
   return false;
+}
+
+std::vector<SIScheduleBlock *> SIScheduleBlockScheduler::findGoodRegUsagePath(unsigned MaxTargetVGPR, unsigned maxNumBlock)
+{
+  std::vector<std::map<unsigned, unsigned>> BackLiveOutRegsNumUsages;
+  std::set<unsigned> BackLiveRegs;
+  std::map<unsigned, unsigned> BackLiveRegsConsumers;
+  std::vector<unsigned> BackLastPosHighLatencyParentScheduled;
+  std::vector<unsigned> BackMaxHeightUnscheduledParent;
+  std::vector<unsigned> BackNumParentsUnschedulable;
+  std::vector<unsigned> BackNumParentsSchedulable;
+  std::vector<unsigned> BackNumReadySuccessors;
+  std::vector<unsigned> BackNumTopHeightParentSuccessors;
+  std::vector<unsigned> BackNumSoonSchedulableSuccessors;
+  std::vector<bool> BackIsScheduled;
+  std::vector<SIScheduleBlock*> BackBlocksScheduled;
+  unsigned BackNumBlockScheduled;
+  std::vector<SIScheduleBlock*> BackReadyBlocks;
+  unsigned BackVregCurrentUsage;
+  unsigned BackSregCurrentUsage;
+  unsigned BackmaxVregUsage;
+  unsigned BackmaxSregUsage;
+  std::vector<unsigned> BackBlockNumPredsLeft;
+  std::vector<unsigned> BackBlockNumSuccsLeft;
+
+  DAG->fillVgprSgprCost(LiveRegs.begin(), LiveRegs.end(), VregCurrentUsage, SregCurrentUsage);
+  if (VregCurrentUsage > maxVregUsage)
+    maxVregUsage = VregCurrentUsage;
+  if (VregCurrentUsage > maxSregUsage)
+    maxSregUsage = VregCurrentUsage;
+  
+  BackLiveOutRegsNumUsages = LiveOutRegsNumUsages;
+  BackLiveRegs = LiveRegs;
+  BackLiveRegsConsumers = LiveRegsConsumers;
+  BackLastPosHighLatencyParentScheduled = LastPosHighLatencyParentScheduled;
+  BackMaxHeightUnscheduledParent = MaxHeightUnscheduledParent;
+  BackNumParentsUnschedulable = NumParentsUnschedulable;
+  BackNumParentsSchedulable = NumParentsSchedulable;
+  BackNumReadySuccessors = NumReadySuccessors;
+  BackNumTopHeightParentSuccessors = NumTopHeightParentSuccessors;
+  BackNumSoonSchedulableSuccessors = NumSoonSchedulableSuccessors;
+  BackIsScheduled = IsScheduled;
+  BackBlocksScheduled = BlocksScheduled;
+  BackNumBlockScheduled = NumBlockScheduled;
+  BackReadyBlocks = ReadyBlocks;
+  BackVregCurrentUsage = VregCurrentUsage;
+  BackSregCurrentUsage = SregCurrentUsage;
+  BackmaxVregUsage = maxVregUsage;
+  BackmaxSregUsage = maxSregUsage;
+  BackBlockNumPredsLeft = BlockNumPredsLeft;
+  BackBlockNumSuccsLeft = BlockNumSuccsLeft;
+
+  std::vector<SIScheduleBlock*> BackReadyBlocks2 = BackReadyBlocks;
+  unsigned maxregusage = INT_MAX;
+  std::vector<SIScheduleBlock*> Best;
+  std::vector<SIScheduleBlock*> BestReadyBlocks = BackReadyBlocks2;
+  
+  for (std::vector<SIScheduleBlock*>::iterator I = BackReadyBlocks2.begin(),
+       E = BackReadyBlocks2.end(); I != E; ++I) {
+    unsigned idx = (I - BackReadyBlocks2.begin());
+    SIScheduleBlock *Block = *I;
+    dbgs() << "Looking for " << Block->ID << "\n";
+    ReadyBlocks.erase(ReadyBlocks.begin() + idx);
+    BlocksScheduled.push_back(Block);
+    blockScheduled(Block);
+    SIScheduleBlock* Succ = pickBlock();
+    if (!Succ) {
+      Best.clear();
+      Best.push_back(Block);
+      BestReadyBlocks = ReadyBlocks;
+    } else {
+    BlocksScheduled.push_back(Succ);
+    blockScheduled(Succ);
+    if (VregCurrentUsage < maxregusage) {
+      maxregusage = VregCurrentUsage;
+      Best.clear();
+      Best.push_back(Block);
+      Best.push_back(Succ);
+      BestReadyBlocks = ReadyBlocks;
+    }
+    }
+    LiveOutRegsNumUsages = BackLiveOutRegsNumUsages;
+  LiveRegs = BackLiveRegs;
+  LiveRegsConsumers = BackLiveRegsConsumers;
+  LastPosHighLatencyParentScheduled = BackLastPosHighLatencyParentScheduled;
+  MaxHeightUnscheduledParent = BackMaxHeightUnscheduledParent;
+  NumParentsUnschedulable = BackNumParentsUnschedulable;
+  NumParentsSchedulable = BackNumParentsSchedulable;
+  NumReadySuccessors = BackNumReadySuccessors;
+  NumTopHeightParentSuccessors = BackNumTopHeightParentSuccessors;
+  NumSoonSchedulableSuccessors = BackNumSoonSchedulableSuccessors;
+  IsScheduled = BackIsScheduled;
+  BlocksScheduled = BackBlocksScheduled;
+  NumBlockScheduled = BackNumBlockScheduled;
+  ReadyBlocks = BackReadyBlocks;
+  VregCurrentUsage = BackVregCurrentUsage;
+  SregCurrentUsage = BackSregCurrentUsage;
+  maxVregUsage = BackmaxVregUsage;
+  maxSregUsage = BackmaxSregUsage;
+  BlockNumPredsLeft = BackBlockNumPredsLeft;
+  BlockNumSuccsLeft = BackBlockNumSuccsLeft;
+  }
+
+  for (auto b : Best) {
+      dbgs() << "Scheduling " << b->ID << "\n";
+      BlocksScheduled.push_back(b);
+      blockScheduled(b);
+    }
+
+  ReadyBlocks = BestReadyBlocks;
+  return Best;
 }
 
 SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
@@ -1636,6 +1809,9 @@ SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
     TryCand.LastPosHighLatParentScheduled =
       LastPosHighLatencyParentScheduled[TryCand.Block->ID];
     TryCand.Height = TryCand.Block->Height;
+    TryCand.ReadySuccessors = NumReadySuccessors[TryCand.Block->ID];
+    TryCand.TopHeightParentSuccessors = NumTopHeightParentSuccessors[TryCand.Block->ID];
+    TryCand.SoonSchedulableSuccessors = NumSoonSchedulableSuccessors[TryCand.Block->ID];
     // Try not to increase VGPR usage too much, else we may spill
     if (VregCurrentUsage > 120 || Variant != SISchedulerBlockSchedulerVariant::BlockLatencyRegUsage) {
       if (!tryCandidateRegUsage(Cand, TryCand) && Variant != SISchedulerBlockSchedulerVariant::BlockRegUsage)
@@ -1658,6 +1834,9 @@ SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
       << (Cand.IsHighLatency ? "yes\n" : "no\n");
     dbgs() << "Position of last high latency dependency: "
            << Cand.LastPosHighLatParentScheduled << '\n';
+    dbgs() << "NumReadySuccessors: " << NumReadySuccessors[Cand.Block->ID] << '\n';
+    dbgs() << "NumTopHeightParentSuccessors: " << NumTopHeightParentSuccessors[Cand.Block->ID] << '\n';
+    dbgs() << "NumSoonSchedulableSuccessors: " << NumSoonSchedulableSuccessors[Cand.Block->ID] << '\n';
     dbgs() << "VGPRUsageDiff: " << Cand.VGPRUsageDiff << '\n';
     dbgs() << '\n';
   );
@@ -1694,17 +1873,68 @@ void SIScheduleBlockScheduler::decreaseLiveRegs(SIScheduleBlock *Block,
 }
 
 void SIScheduleBlockScheduler::releaseBlockSuccs(SIScheduleBlock *Parent) {
+  unsigned HeightParent = Parent->Height;
   for (SIScheduleBlock* Block : Parent->Succs) {
-    --BlockNumPredsLeft[Block->ID];
-    if (BlockNumPredsLeft[Block->ID] == 0) {
-      ReadyBlocks.push_back(Block);
-    }
     if (Parent->isHighLatencyBlock())
       LastPosHighLatencyParentScheduled[Block->ID] = NumBlockScheduled;
+
+    if (MaxHeightUnscheduledParent[Block->ID] == HeightParent) {
+      unsigned NewMaxHeight = Block->Height;
+      for (SIScheduleBlock* Pred : Block->Preds) {
+        if (IsScheduled[Pred->ID])
+          continue;
+        if (NewMaxHeight < Pred->Height)
+          NewMaxHeight = Pred->Height;
+      }
+      // No update to do if other parent of same height
+      if (NewMaxHeight != HeightParent) {
+        MaxHeightUnscheduledParent[Block->ID] = NewMaxHeight;
+        for (SIScheduleBlock* Pred : Block->Preds) {
+          if (IsScheduled[Pred->ID])
+            continue;
+          if (NewMaxHeight == Pred->Height)
+            NumTopHeightParentSuccessors[Pred->ID]++;// TODO: debug info shows computation wrong
+        }
+      }
+    }
+
+    NumParentsSchedulable[Block->ID]--;
+    if (NumParentsSchedulable[Block->ID] == 1 &&
+        NumParentsUnschedulable[Block->ID] == 0) {
+      for (SIScheduleBlock* Pred : Block->Preds) {
+        if (IsScheduled[Pred->ID])
+          continue;
+        NumSoonSchedulableSuccessors[Pred->ID]--;
+        NumReadySuccessors[Pred->ID]++;
+      }
+    }
+
+    --BlockNumPredsLeft[Block->ID];
+    if (BlockNumPredsLeft[Block->ID] == 0) {
+      for (SIScheduleBlock* Succ : Block->Succs) {
+        NumParentsUnschedulable[Succ->ID]--;
+        NumParentsSchedulable[Succ->ID]++;
+        if (NumParentsUnschedulable[Succ->ID] == 0 &&
+            NumParentsSchedulable[Succ->ID] == 1)
+          NumReadySuccessors[Block->ID]++;
+        else if (NumParentsUnschedulable[Succ->ID] == 0) {
+          for (SIScheduleBlock* SuccPred : Succ->Preds) {
+            if (IsScheduled[SuccPred->ID])
+              continue;
+            NumSoonSchedulableSuccessors[SuccPred->ID]++;
+          } 
+        }
+      }
+
+      ReadyBlocks.push_back(Block);
+    }
   }
 }
 
 void SIScheduleBlockScheduler::blockScheduled(SIScheduleBlock *Block) {
+  IsScheduled[Block->ID] == true;
+  assert(NumParentsSchedulable[Block->ID] == 0);
+  assert(NumParentsUnschedulable[Block->ID] == 0);
   decreaseLiveRegs(Block, Block->getInRegs());
   addLiveRegs(Block->getOutRegs());
   releaseBlockSuccs(Block);
