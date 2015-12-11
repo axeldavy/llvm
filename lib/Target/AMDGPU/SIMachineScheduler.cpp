@@ -1000,7 +1000,54 @@ void SIScheduleBlockCreator::colorMergeIfPossibleSmallGroupsToNextGroup() {
 }
 
 void SIScheduleBlockCreator::cutHugeBlocks() {
-  // TODO
+  // TODO. For now simply divide huge blocks by cutting when SUs
+  // are not consecutive
+  unsigned DAGSize = DAG->SUnits.size();
+  std::map<unsigned, unsigned> ColorCount;
+
+  if (DAGSize <= 1)
+    return;
+
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &DAG->SUnits[DAG->BottomUpIndex2SU[i]];
+    unsigned color = CurrentColoring[SU->NodeNum];
+    std::map<unsigned, unsigned>::iterator Pos = ColorCount.find(color);
+      if (Pos != ColorCount.end()) {
+        ++ColorCount[color];
+      } else {
+        ColorCount[color] = 1;
+      }
+  }
+
+  unsigned PreviousColor;
+  std::set<unsigned> SeenColors;
+
+  PreviousColor = CurrentColoring[0];
+
+  for (unsigned i = 1, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &DAG->SUnits[i];
+    unsigned CurrentColor = CurrentColoring[i];
+    unsigned PreviousColorSave = PreviousColor;
+    assert(i == SU->NodeNum);
+
+    if (CurrentColor != PreviousColor)
+      SeenColors.insert(PreviousColor);
+    PreviousColor = CurrentColor;
+
+    if (ColorCount[CurrentColoring[SU->NodeNum]] < 30)
+      continue;
+
+    if (CurrentColoring[SU->NodeNum] <= (int)DAGSize)
+      continue;
+
+    if (SeenColors.find(CurrentColor) == SeenColors.end())
+      continue;
+
+    if (PreviousColorSave != CurrentColor)
+      CurrentColoring[i] = NextNonReservedID++;
+    else
+      CurrentColoring[i] = CurrentColoring[i-1];
+  }
 }
 
 void SIScheduleBlockCreator::regroupNoUserInstructions() {
@@ -1052,6 +1099,7 @@ void SIScheduleBlockCreator::createBlocksForVariant(SISchedulerBlockCreatorVaria
   if (BlockVariant == SISchedulerBlockCreatorVariant::LatenciesAlonePlusConsecutive)
     colorForceConsecutiveOrderInGroup();
   regroupNoUserInstructions();
+  //cutHugeBlocks();
   colorMergeConstantLoadsNextGroup();
   colorMergeIfPossibleNextGroupOnlyForReserved();
 
