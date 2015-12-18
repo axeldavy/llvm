@@ -737,6 +737,11 @@ namespace llvm {
     /// ordering from the DAG to be scheduled.
     void InitDAGTopologicalSorting();
 
+    /// GetPath - Returns an array of SUs to reach StartSU from TargetSU.
+    /// The elements of the array are not sorted.
+    std::vector<int> GetPath(const SUnit *StartSU, const SUnit *TargetSU,
+                             bool &Success);
+
     /// IsReachable - Checks if SU is reachable from TargetSU.
     bool IsReachable(const SUnit *SU, const SUnit *TargetSU);
 

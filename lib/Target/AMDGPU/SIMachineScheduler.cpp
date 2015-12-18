@@ -647,7 +647,7 @@ void SIScheduleBlockCreator::colorHighLatenciesGroups() {
   unsigned DAGSize = DAG->SUnits.size();
   unsigned NumHighLatencies = 0;
   unsigned GroupSize;
-  unsigned Color = NextReservedID;
+  int Color = NextReservedID;
   unsigned Count = 0;
   std::set<unsigned> FormingGroup;
 
@@ -671,29 +671,56 @@ void SIScheduleBlockCreator::colorHighLatenciesGroups() {
     SUnit *SU = &DAG->SUnits[i];
     if (DAG->IsHighLatencySU[SU->NodeNum]) {
       unsigned CompatibleGroup = true;
-      unsigned ProposedColor = Color;
+      int ProposedColor = Color;
+      std::vector<int> AdditionnalElements;
+
       for (unsigned j : FormingGroup) {
-        // TODO: Currently CompatibleGroup will always be false,
-        // because the graph enforces the load order. This
-        // can be fixed, but as keeping the load order is often
-        // good for performance that causes a performance hit (both
-        // the default scheduler and this scheduler).
-        // When this scheduler determines a good load order,
-        // this can be fixed.
-        if (!DAG->canAddEdge(SU, &DAG->SUnits[j]) ||
-            !DAG->canAddEdge(&DAG->SUnits[j], SU))
-          CompatibleGroup = false;
+        //if (!DAG->canAddEdge(SU, &DAG->SUnits[j]) ||
+        //    !DAG->canAddEdge(&DAG->SUnits[j], SU)) {
+        {bool HasPath;
+          std::vector<int> Path = DAG->GetTopo()->GetPath(&DAG->SUnits[j], SU, HasPath);
+          if (!HasPath)
+            Path = DAG->GetTopo()->GetPath(SU, &DAG->SUnits[j], HasPath);
+          if (!HasPath)
+            CompatibleGroup = false;
+          if (Path.size() > 5)
+            CompatibleGroup = false;
+          //dbgs() << "\n From" << SU->NodeNum << " to " << j << " : "; 
+          for (unsigned k : Path) {
+            if (DAG->IsHighLatencySU[k] || (CurrentColoring[k] != ProposedColor && CurrentColoring[k] != 0))
+              CompatibleGroup = false;
+            for (SDep& PredDep : (&DAG->SUnits[k])->Preds) {
+              // We don't want any instruction which directly depend on another high latency
+              // on the same group. We do allow only order dependencies (WAR and WAW).
+              if (PredDep.getSUnit()->NodeNum == j &&
+                  PredDep.getKind() == llvm::SDep::Data)
+                CompatibleGroup = false;
+            }
+            AdditionnalElements.push_back(k);
+            //dbgs() << k << " ";
+          }
+          // Same check for the SU
+          for (SDep& PredDep : SU->Preds) {
+            if (PredDep.getSUnit()->NodeNum == j &&
+                PredDep.getKind() == llvm::SDep::Data)
+              CompatibleGroup = false;
+          }
+          //dbgs() << "\n" << CompatibleGroup << "\n";
+          AdditionnalElements.insert(AdditionnalElements.end(), Path.begin(), Path.end());
+        }
       }
-      if (!CompatibleGroup || ++Count == GroupSize) {
+      if (!CompatibleGroup || ++Count == GroupSize) {//dbgs() << "Not adding\n";
         FormingGroup.clear();
         Color = ++NextReservedID;
-        if (!CompatibleGroup) {
+        //if (!CompatibleGroup) {
           ProposedColor = Color;
           FormingGroup.insert(SU->NodeNum);
-        }
+        //}
         Count = 0;
       } else {
-        FormingGroup.insert(SU->NodeNum);
+        FormingGroup.insert(SU->NodeNum);//dbgs() << "Adding." << AdditionnalElements.size() << "\n";
+        for (unsigned j : AdditionnalElements) //{
+          CurrentColoring[j] = ProposedColor; //dbgs() << "\nadding " << j << " with " << SU->NodeNum << "\n";}
       }
       CurrentColoring[SU->NodeNum] = ProposedColor;
     }
@@ -1939,7 +1966,7 @@ void SIScheduleDAGMI::schedule()
   }
 
   SIScheduler Scheduler(this);
-  Best = Scheduler.scheduleVariant(SISchedulerBlockCreatorVariant::LatenciesAlone,
+  Best = Scheduler.scheduleVariant(SISchedulerBlockCreatorVariant::LatenciesGrouped,
                                    SISchedulerBlockSchedulerVariant::BlockLatencyRegUsage);
 
   // if VGPR usage is extremely high, try other good performing variants

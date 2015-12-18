@@ -568,6 +568,83 @@ void ScheduleDAGTopologicalSort::DFS(const SUnit *SU, int UpperBound,
   } while (!WorkList.empty());
 }
 
+/// GetPath - Returns an array of SUs to reach StartSU from TargetSU.
+/// The elements of the array are not sorted.
+std::vector<int> ScheduleDAGTopologicalSort::GetPath(const SUnit *StartSU,
+                                                    const SUnit *TargetSU,
+                                                    bool &Success) {
+  std::vector<const SUnit*> WorkList;
+  int LowerBound = Node2Index[StartSU->NodeNum];
+  int UpperBound = Node2Index[TargetSU->NodeNum];
+  bool Found = false;
+  BitVector VisitedBack;
+  std::vector<int> Path;
+
+  if (LowerBound > UpperBound) {
+    Success = false;
+    return Path;
+  }
+
+  WorkList.reserve(SUnits.size());
+  Visited.reset();
+
+  WorkList.push_back(StartSU);
+  do {
+    const SUnit *SU = WorkList.back();
+    WorkList.pop_back();
+    Visited.set(SU->NodeNum);
+    for (int I = SU->Succs.size()-1; I >= 0; --I) {
+      unsigned s = SU->Succs[I].getSUnit()->NodeNum;
+      // Edges to non-SUnits are allowed but ignored (e.g. ExitSU).
+      if (s >= Node2Index.size())
+        continue;
+      if (Node2Index[s] == UpperBound) {
+        Found = true;
+        continue;
+      }
+      // Visit successors if not already and in affected region.
+      if (!Visited.test(s) && Node2Index[s] < UpperBound) {
+        WorkList.push_back(SU->Succs[I].getSUnit());
+      }
+    }
+  } while (!WorkList.empty());
+
+  if (!Found) {
+    Success = false;
+    return Path;
+  }
+
+  WorkList.clear();
+  VisitedBack.resize(SUnits.size());
+  Found = false;
+
+  WorkList.push_back(TargetSU);
+
+  do {
+    const SUnit *SU = WorkList.back();
+    WorkList.pop_back();
+    VisitedBack.set(SU->NodeNum);
+    for (int I = SU->Preds.size()-1; I >= 0; --I) {
+      unsigned s = SU->Preds[I].getSUnit()->NodeNum;
+      // Edges to non-SUnits are allowed but ignored (e.g. EntrySU).
+      if (s >= Node2Index.size())
+        continue;
+      if (Node2Index[s] == LowerBound) {
+        Found = true;
+        continue;
+      }
+      if (!VisitedBack.test(s) && Visited.test(s)) {
+        WorkList.push_back(SU->Preds[I].getSUnit());
+        Path.push_back(s);
+      }
+    }
+  } while (!WorkList.empty());
+
+  assert(Found);
+  Success = true;
+  return Path;
+}
+
 /// Shift - Renumber the nodes so that the topological ordering is
 /// preserved.
 void ScheduleDAGTopologicalSort::Shift(BitVector& Visited, int LowerBound,
