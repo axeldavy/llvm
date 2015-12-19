@@ -164,7 +164,7 @@ static void foldImmediates(MachineInstr &MI, const SIInstrInfo *TII,
       MachineOperand &MovSrc = Def->getOperand(1);
       bool ConstantFolded = false;
 
-      if (MovSrc.isImm() && isUInt<32>(MovSrc.getImm())) {
+      if (MovSrc.isImm() && isInt<32>(MovSrc.getImm())) {
         Src0.ChangeToImmediate(MovSrc.getImm());
         ConstantFolded = true;
       }
