@@ -2945,6 +2945,10 @@ bool SIInstrInfo::isHighLatencyInstruction(const MachineInstr *MI) const {
   return isMUBUF(Opc) || isMTBUF(Opc) || isMIMG(Opc);
 }
 
+bool SIInstrInfo::isExportInstruction(const MachineInstr *MI) const {
+  return MI->getOpcode() == AMDGPU::EXP;
+}
+
 ArrayRef<std::pair<int, const char *>>
 SIInstrInfo::getSerializableTargetIndices() const {
   static const std::pair<int, const char *> TargetIndices[] = {

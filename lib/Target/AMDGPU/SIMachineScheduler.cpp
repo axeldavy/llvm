@@ -197,6 +197,9 @@ void SIScheduleBlock::tryCandidateTopDown(SISchedCandidate &Cand,
     return;
   }
 
+  if (tryLess(DAG->IsExportSU[TryCand.SU->NodeNum], DAG->IsExportSU[Cand.SU->NodeNum], TryCand, Cand, Latency))
+    return;
+
   if (Cand.SGPRUsage > 60 &&
       tryLess(TryCand.SGPRUsage, Cand.SGPRUsage, TryCand, Cand, RegUsage))
     return;
@@ -727,6 +730,18 @@ void SIScheduleBlockCreator::colorHighLatenciesGroups() {
   }
 }
 
+void SIScheduleBlockCreator::colorExports() {
+  unsigned DAGSize = DAG->SUnits.size();
+  unsigned ExportColor = NextNonReservedID++;
+
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &DAG->SUnits[i];
+    if (DAG->IsExportSU[SU->NodeNum]) {
+      CurrentColoring[SU->NodeNum] = ExportColor;
+    }
+  }
+}
+
 void SIScheduleBlockCreator::colorComputeReservedDependencies() {
   unsigned DAGSize = DAG->SUnits.size();
   std::map<std::set<unsigned>, unsigned> ColorCombinations;
@@ -1129,6 +1144,7 @@ void SIScheduleBlockCreator::createBlocksForVariant(SISchedulerBlockCreatorVaria
   //cutHugeBlocks();
   colorMergeConstantLoadsNextGroup();
   colorMergeIfPossibleNextGroupOnlyForReserved();
+  colorExports();
 
   // Put SUs of same color into same block
   Node2CurrentBlock.resize(DAGSize, -1);
@@ -1729,6 +1745,162 @@ SIScheduler::scheduleVariant(SISchedulerBlockCreatorVariant BlockVariant,
   return Res;
 }
 
+// SISchedulerLowLatOptimizer //
+/*
+std::vector<unsigned>
+SISchedulerLowLatOptimizer::improveSchedule(std::vector<unsigned> SUs) {
+  IntervalPressure Pressure, TopPressure;
+  RegPressureTracker RPTracker(Pressure), TopRPTracker(TopPressure);
+  LiveIntervals *LIS = DAG->getLIS();
+  MachineRegisterInfo *MRI = DAG->getMRI();
+  std::vector<unsigned> Res;
+  unsigned DAGSize = SUs.size();
+  unsigned SGPRSetID = DAG->SGPRSetID;
+
+  DAG->initRPTracker(TopRPTracker);
+  DAG->initRPTracker(RPTracker);
+
+  SGPRUsage.clear();
+  SUsPosWOLoads.clear();
+  SUsPosWOLoadsOffsets.clear();
+  SUsOrderWOLoads.clear();
+  SUsPosLoads.clear();
+  SUsPosLoadsOffsets.clear();
+  SUsOrderLoads.clear();
+  SUsLoads.clear();
+  SGPRUsage.reserve(DAGSize + 1);
+  SUsPosWOLoads.reserve(DAGSize);
+  SUsPosWOLoadsOffsets.reserve(DAGSize);
+  SUsPosLoads.reserve(DAGSize);
+  SUsPosLoadsOffsets.reserve(DAGSize);
+  SUsLoads.reserve(DAGSize);
+  Res.reserve(DAGSize);
+
+  // Goes though all SU. RPTracker captures what had to be alive for the SUs
+  // to execute, and what is still alive at the end.
+  for (unsigned i = 0; i < DAGSize; i++) {
+    SUnit* SU = &DAG->SUnits(SUs[i]);
+    RPTracker.setPos(SU->getInstr());
+    RPTracker.advance();
+  }
+
+  // Initialize the live ins.
+  TopRPTracker.addLiveRegs(RPTracker.getPressure().LiveInRegs);
+
+  for (unsigned i = 0; i < DAGSize; i++) {
+    SUnit* SU = &DAG->SUnits(SUs[i]);
+    SGPRUsage[i] = TopRPTracker.getRegSetPressureAtPos[SGPRSetID];
+    TopRPTracker.setPos(SU->getInstr());
+    TopRPTracker.advance();
+  }
+  SGPRUsage[DAGSize] = TopRPTracker.getRegSetPressureAtPos[SGPRSetID];
+
+  for (unsigned i = 0, j = 0, l = 0; i < DAGSize; i++) {
+    if (DAG->IsLowLatencySU[SUs[i]]) {
+      SUsLoads.push_back(&DAG->SUnits(SUs[i]));
+      SUsPosLoads[SUs[i]] = l++;
+      SUsPosLoadsOffsets[SUs[i]] = i - SUsPosLoads[SUs[i]];
+      SUsOrderLoads.push_back(SUs[i]);
+    } else {
+      SUsPosWOLoads[SUs[i]] = j++;
+      SUsPosWOLoadsOffsets[SUs[i]] = i - SUsPosWOLoads[SUs[i]];
+      SUsOrderWOLoads.push_back(SUs[i]);
+    }
+  }
+
+  studyLoads();
+  distributeLoads();
+  mergeLoads();
+  moveUpLowLatencies();
+
+  for (unsigned i = 0; i < DAGSize; i++) {
+    if (DAG->IsLowLatencySU[i]) {
+      Res[SUsPosLoads[i] + SUsPosLoadsOffsets[i]] = i;
+    } else {
+      Res[SUsPosWOLoads[i] + SUsPosWOLoadsOffsets[i]] = i;
+    }
+  }
+}
+
+void SISchedulerLowLatOptimizer::studyLoads() {
+  LoadInputSet.clear();
+  LoadOffset.clear();
+}
+
+void SISchedulerLowLatOptimizer::distributeLoads() {
+  
+}
+
+void SISchedulerLowLatOptimizer::mergeLoads() {
+  
+}
+
+void SISchedulerLowLatOptimizer::moveUpLowLatencies() {
+  unsigned DAGSize = SUsPosWOLoads.size();
+  std::vector<unsigned> SUsTriggeringWait;
+   int LastLowLatencyUser = -1;
+   int LastLowLatencyPos = -1;
+
+   for (unsigned i = 0, e = ScheduledSUnits.size(); i != e; ++i) {
+    SUnit *SU = &SUnits[ScheduledSUnits[i]];
+    bool IsLowLatencyUser = false;
+    unsigned MinPos = 0;
+
+    for (SDep& PredDep : SU->Preds) {
+      SUnit *Pred = PredDep.getSUnit();
+      if (SITII->isLowLatencyInstruction(Pred->getInstr())) {
+        IsLowLatencyUser = true;
+      }
+      if (Pred->NodeNum >= DAGSize)
+        continue;
+      unsigned PredPos = ScheduledSUnitsInv[Pred->NodeNum];
+      if (PredPos >= MinPos)
+        MinPos = PredPos + 1;
+    }
+
+    if (SITII->isLowLatencyInstruction(SU->getInstr())) {
+      unsigned BestPos = LastLowLatencyUser + 1;
+      if ((int)BestPos <= LastLowLatencyPos)
+        BestPos = LastLowLatencyPos + 1;
+      if (BestPos < MinPos)
+        BestPos = MinPos;
+      if (BestPos < i) {
+        for (unsigned u = i; u > BestPos; --u) {
+          ++ScheduledSUnitsInv[ScheduledSUnits[u-1]];
+          ScheduledSUnits[u] = ScheduledSUnits[u-1];
+        }
+        ScheduledSUnits[BestPos] = SU->NodeNum;
+        ScheduledSUnitsInv[SU->NodeNum] = BestPos;
+      }
+      LastLowLatencyPos = BestPos;
+      if (IsLowLatencyUser)
+        LastLowLatencyUser = BestPos;
+    } else if (IsLowLatencyUser) {
+      LastLowLatencyUser = i;
+    // Moves COPY instructions on which depends
+    // the low latency instructions too.
+    } else if (SU->getInstr()->getOpcode() == AMDGPU::COPY) {
+      bool CopyForLowLat = false;
+      for (SDep& SuccDep : SU->Succs) {
+        SUnit *Succ = SuccDep.getSUnit();
+        if (SITII->isLowLatencyInstruction(Succ->getInstr())) {
+          CopyForLowLat = true;
+        }
+      }
+      if (!CopyForLowLat)
+        continue;
+      if (MinPos < i) {
+        for (unsigned u = i; u > MinPos; --u) {
+          ++ScheduledSUnitsInv[ScheduledSUnits[u-1]];
+          ScheduledSUnits[u] = ScheduledSUnits[u-1];
+        }
+        ScheduledSUnits[MinPos] = SU->NodeNum;
+        ScheduledSUnitsInv[SU->NodeNum] = MinPos;
+      }
+    }
+  }
+}
+*/
 // SIScheduleDAGMI //
 
 SIScheduleDAGMI::SIScheduleDAGMI(MachineSchedContext *C) :
@@ -1947,10 +2119,12 @@ void SIScheduleDAGMI::schedule()
   IsLowLatencySU.clear();
   LowLatencyOffset.clear();
   IsHighLatencySU.clear();
+  IsExportSU.clear();
 
   IsLowLatencySU.resize(SUnits.size(), 0);
   LowLatencyOffset.resize(SUnits.size(), 0);
   IsHighLatencySU.resize(SUnits.size(), 0);
+  IsExportSU.resize(SUnits.size(), 0);
 
   for (unsigned i = 0, e = (unsigned)SUnits.size(); i != e; ++i) {
     SUnit *SU = &SUnits[i];
@@ -1963,6 +2137,8 @@ void SIScheduleDAGMI::schedule()
         LowLatencyOffset[i] = OffLatReg;
     } else if (SITII->isHighLatencyInstruction(SU->getInstr()))
       IsHighLatencySU[i] = 1;
+    else if (SITII->isExportInstruction(SU->getInstr()))
+      IsExportSU[i] = 1;
   }
 
   SIScheduler Scheduler(this);

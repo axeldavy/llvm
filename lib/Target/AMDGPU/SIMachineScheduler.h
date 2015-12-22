@@ -256,6 +256,9 @@ private:
   // Create groups of high latencies with a Reserved color.
   void colorHighLatenciesGroups();
 
+  // Give Reserved color to export instructions
+  void colorExports();
+
   // Compute coloring for topdown and bottom traversals with
   // different colors depending on dependencies on Reserved colors.
   void colorComputeReservedDependencies();
@@ -417,6 +420,54 @@ public:
   scheduleVariant(SISchedulerBlockCreatorVariant BlockVariant,
                   SISchedulerBlockSchedulerVariant ScheduleVariant);
 };
+/*
+class SISchedulerLowLatOptimizer {
+  SIScheduleDAGMI *DAG;
+
+  // Register Pressure tracking
+  std::vector<unsigned> SGPRUsage;
+
+  // Position of the SUs if there was no loads
+  std::vector<unsigned> SUsPosWOLoads;
+  // Offsets to get back the original position
+  std::vector<unsigned> SUsPosWOLoadsOffsets;
+  // All the non loads in the order of the current schedule
+  std::vector<unsigned> SUsOrderWOLoads;
+  // Position of the SUs if there was only loads
+  std::vector<unsigned> SUsPosLoads;
+  // Offsets to get back the original position
+  std::vector<unsigned> SUsPosLoadsOffsets;
+  // All the loads in the order of the current schedule
+  std::vector<unsigned> SUsOrderLoads;
+  // Pointer to the loads
+  std::vector<SUnits *> SUsLoads;
+
+  // Each load is associated an id depending
+  // on which address they look at
+  std::vector<unsigned> LoadInputSet;
+  std::vector<unsigned> LoadOffset;
+
+public:
+  SISchedulerLowLatOptimizer(SIScheduleDAGMI *DAG) : DAG(DAG) {};
+
+  ~SISchedulerLowLatOptimizer() {};
+
+  std::vector<unsigned> improveSchedule(std::vector<unsigned> SUs);
+
+private:
+  // Look at the different addresses and offsets.
+  // Find potential loads that could be merged together
+  // for free.
+  void studyLoads();
+  // If there are too many loads packed together, find better location
+  // for some.
+  void distributeLoads();
+  // Merge loads that could be merged together for free,
+  // if it doesn't increase register usage too much.
+  void mergeLoads();
+  // Put loads further away from the users.
+  void moveUpLowLatencies();
+};*/
 
 class SIScheduleDAGMI final : public ScheduleDAGMILive {
   const SIInstrInfo *SITII;
@@ -473,7 +524,6 @@ public:
 
 private:
   void topologicalSort();
-  // After scheduling is done, improve low latency placements.
   void moveLowLatencies();
 
 public:
@@ -481,6 +531,7 @@ public:
   std::vector<unsigned> IsLowLatencySU;
   std::vector<unsigned> LowLatencyOffset;
   std::vector<unsigned> IsHighLatencySU;
+  std::vector<unsigned> IsExportSU;
   // Topological sort
   // Maps topological index to the node number.
   std::vector<int> TopDownIndex2SU;
