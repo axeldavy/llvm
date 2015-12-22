@@ -50,6 +50,7 @@ extern "C" void LLVMInitializeAMDGPUTarget() {
   initializeSIFoldOperandsPass(*PR);
   initializeSIFixSGPRLiveRangesPass(*PR);
   initializeSIFixControlFlowLiveIntervalsPass(*PR);
+  initializeSILoadDuplicatePass(*PR);
   initializeSILoadStoreOptimizerPass(*PR);
   initializeAMDGPUAnnotateKernelFeaturesPass(*PR);
   initializeAMDGPUAnnotateUniformValuesPass(*PR);
@@ -330,6 +331,7 @@ bool GCNPassConfig::addInstSelector() {
 void GCNPassConfig::addPreRegAlloc() {
   const AMDGPUSubtarget &ST = *getAMDGPUTargetMachine().getSubtargetImpl();
 
+  addPass(&SILoadDuplicateID, false);
   // This needs to be run directly before register allocation because
   // earlier passes might recompute live intervals.
   // TODO: handle CodeGenOpt::None; fast RA ignores spill weights set by the pass
