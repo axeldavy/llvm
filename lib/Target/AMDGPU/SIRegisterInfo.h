@@ -25,6 +25,9 @@ namespace llvm {
 
 struct SIRegisterInfo final : public AMDGPURegisterInfo {
 private:
+  unsigned SGPRsForWaveFronts[10];
+  unsigned SGPRsForWaveFrontsVI[10];
+  unsigned VGPRsForWaveFronts[10];
   unsigned SGPR32SetID;
   unsigned VGPR32SetID;
   BitVector SGPRPressureSets;
@@ -166,6 +169,13 @@ public:
 
   unsigned getSGPR32PressureSet() const { return SGPR32SetID; };
   unsigned getVGPR32PressureSet() const { return VGPR32SetID; };
+
+  unsigned getWaveFrontsForUsage(AMDGPUSubtarget::Generation gen,
+                                 unsigned SGPRsUsed,
+                                 unsigned VGPRsUsed) const;
+  unsigned spillCost(AMDGPUSubtarget::Generation gen,
+                     unsigned SGPRsUsed,
+                     unsigned VGPRsUsed) const;
 
 private:
   void buildScratchLoadStore(MachineBasicBlock::iterator MI,

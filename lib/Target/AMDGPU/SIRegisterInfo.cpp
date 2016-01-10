@@ -47,6 +47,12 @@ SIRegisterInfo::SIRegisterInfo() : AMDGPURegisterInfo(),
                                    VGPRPressureSets(getNumRegPressureSets()) {
   unsigned NumRegPressureSets = getNumRegPressureSets();
 
+  for (unsigned i = 0; i < 10; ++i) {
+    SGPRsForWaveFronts[i] = getNumSGPRsAllowed(AMDGPUSubtarget::SOUTHERN_ISLANDS, i+1);
+    SGPRsForWaveFrontsVI[i] = getNumSGPRsAllowed(AMDGPUSubtarget::VOLCANIC_ISLANDS, i+1);
+    VGPRsForWaveFronts[i] = getNumVGPRsAllowed(i+1);
+  }
+
   SGPR32SetID = NumRegPressureSets;
   VGPR32SetID = NumRegPressureSets;
   for (unsigned i = 0; i < NumRegPressureSets; ++i) {
@@ -788,4 +794,38 @@ unsigned SIRegisterInfo::getNumSGPRsAllowed(AMDGPUSubtarget::Generation gen,
       default: return 103;
     }
   }
+}
+
+unsigned SIRegisterInfo::getWaveFrontsForUsage(AMDGPUSubtarget::Generation gen,
+                                               unsigned SGPRsUsed,
+                                               unsigned VGPRsUsed) const {
+  unsigned i;
+  const unsigned *SGPRsForWaveFrontsForGen =
+    gen >= AMDGPUSubtarget::VOLCANIC_ISLANDS ?
+      &SGPRsForWaveFrontsVI[0] : &SGPRsForWaveFronts[0];
+
+  for (i = 9; i > 0; --i) {
+    if (SGPRsForWaveFrontsForGen[i] >= SGPRsUsed &&
+        VGPRsForWaveFronts[i] >= VGPRsUsed)
+      break;
+  }
+
+  return i + 1;
+}
+
+unsigned SIRegisterInfo::spillCost(AMDGPUSubtarget::Generation gen,
+                                   unsigned SGPRsUsed,
+                                   unsigned VGPRsUsed) const {
+  unsigned cost = 0;
+   const unsigned *SGPRsForWaveFrontsForGen =
+    gen >= AMDGPUSubtarget::VOLCANIC_ISLANDS ?
+      &SGPRsForWaveFrontsVI[0] : &SGPRsForWaveFronts[0];
+
+  if (SGPRsForWaveFrontsForGen[0] < SGPRsUsed)
+    cost += SGPRsUsed - SGPRsForWaveFrontsForGen[0];
+  // Spilling VGPRs hurts more than SGPRs
+  if (VGPRsForWaveFronts[0] < VGPRsUsed)
+    cost += 4 * (VGPRsUsed - VGPRsForWaveFronts[0]);
+
+  return cost;
 }
