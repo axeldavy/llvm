@@ -197,7 +197,7 @@ MachineBasicBlock::iterator SILoadBufferOptimizer::mergeLoads(MachineBasicBlock 
 
   updateRegDefsUses(DestReg0, DestReg, AMDGPU::sub0);
 
-  LIS->RemoveMachineInstrFromMaps(I);
+  LIS->RemoveMachineInstrFromMaps(*I);
   I->eraseFromParent();
   MachineBasicBlock::iterator Inext = I2;
 
@@ -207,7 +207,7 @@ MachineBasicBlock::iterator SILoadBufferOptimizer::mergeLoads(MachineBasicBlock 
     unsigned DestReg1
         = TII->getNamedOperand(*I2, AMDGPU::OpName::dst)->getReg();
     updateRegDefsUses(DestReg1, DestReg, SubForNum[n]);
-    LIS->ReplaceMachineInstrInMaps(I2, Load_Buffer_2);
+    LIS->ReplaceMachineInstrInMaps(*I2, *Load_Buffer_2);
 
     I2->eraseFromParent();
   }
