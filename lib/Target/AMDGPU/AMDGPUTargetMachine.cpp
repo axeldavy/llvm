@@ -348,10 +348,6 @@ void GCNPassConfig::addPreRegAlloc() {
     insertPass(&MachineSchedulerID, &SILoadStoreOptimizerID);
     insertPass(&MachineSchedulerID, &RegisterCoalescerID);
   }
-  if (getOptLevel() > CodeGenOpt::None) {
-    initializeSILoadBufferOptimizerPass(*PassRegistry::getPassRegistry());
-    insertPass(&MachineSchedulerID, &SILoadBufferOptimizerID);
-  }
   addPass(createSIShrinkInstructionsPass(), false);
   addPass(createSIWholeQuadModePass());
 }
