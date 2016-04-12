@@ -174,11 +174,11 @@ SIMachineModel::getInstrExecInfoForSchedule(std::vector<SUnit*> Schedule, unsign
     unsigned lattype = 0;
 
     NextCycle = CurCycle;
-    // Has Parent in Flight ? -> Wait for them
+    // Has Parent in Flight ? -> Wait for them (if data dependency)
     for (struct SIInstrExecInfoInFlight &Flying : InFlight) {
       for (SDep& SuccDep : Flying.SU->Preds) {
         SUnit *Succ = SuccDep.getSUnit();
-        if (SuccDep.isWeak() || Succ->NodeNum >= DAGSize)
+        if (SuccDep.isCtrl()|| Succ->NodeNum >= DAGSize)
           continue;
         if (Succ->NodeNum == SU->NodeNum) {
           lattype |= Infos[Flying.ScheduleIndex].Type <= 2 ? 1 : 2;
@@ -745,24 +745,27 @@ void SIScheduleBlock::addPred(SIScheduleBlock *Pred) {
   Preds.push_back(Pred);
 
 #ifndef NDEBUG
-  for (SIScheduleBlock* S : Succs) {
-    if (PredID == S->getID())
+  for (std::pair<SIScheduleBlock*, enum SIScheduleBlockLinkKind> S : Succs) {
+    if (PredID == S.first->getID())
       assert(!"Loop in the Block Graph!\n");
   }
 #endif
 }
 
-void SIScheduleBlock::addSucc(SIScheduleBlock *Succ) {
+void SIScheduleBlock::addSucc(SIScheduleBlock *Succ, enum SIScheduleBlockLinkKind Kind) {
   unsigned SuccID = Succ->getID();
 
   // Check if not already predecessor.
-  for (SIScheduleBlock* S : Succs) {
-    if (SuccID == S->getID())
+  for (std::pair<SIScheduleBlock*, enum SIScheduleBlockLinkKind> &S : Succs) {
+    if (SuccID == S.first->getID()) {
+      if (S.second > Kind)
+        S.second = Kind;
       return;
+    }
   }
   if (Succ->isHighLatencyBlock())
     ++NumHighLatencySuccessors;
-  Succs.push_back(Succ);
+  Succs.push_back(std::pair<SIScheduleBlock*, enum SIScheduleBlockLinkKind> (Succ, Kind));
 #ifndef NDEBUG
   for (SIScheduleBlock* P : Preds) {
     if (SuccID == P->getID())
@@ -785,8 +788,10 @@ void SIScheduleBlock::printDebug(bool full) {
   }
 
   dbgs() << "\nSuccessors:\n";
-  for (SIScheduleBlock* S : Succs) {
-    S->printDebug(false);
+  for (std::pair<SIScheduleBlock*, enum SIScheduleBlockLinkKind> S : Succs) {
+    if (S.second)
+      dbgs() << "(Data Dep) ";
+    S.first->printDebug(false);
   }
 
   if (Scheduled) {
@@ -1390,7 +1395,7 @@ void SIScheduleBlockCreator::createBlocksForVariant(SISchedulerBlockCreatorVaria
       if (SuccDep.isWeak() || Succ->NodeNum >= DAGSize)
         continue;
       if (Node2CurrentBlock[Succ->NodeNum] != SUID)
-        CurrentBlocks[SUID]->addSucc(CurrentBlocks[Node2CurrentBlock[Succ->NodeNum]]);
+        CurrentBlocks[SUID]->addSucc(CurrentBlocks[Node2CurrentBlock[Succ->NodeNum]], SuccDep.isCtrl() ? NoData : Data);
     }
     for (SDep& PredDep : SU->Preds) {
       SUnit *Pred = PredDep.getSUnit();
@@ -1597,9 +1602,9 @@ void SIScheduleBlockCreator::fillStats() {
       Block->Height = 0;
     else {
       unsigned Height = 0;
-      for (SIScheduleBlock *Succ : Block->getSuccs()) {
-        if (Height < Succ->Height + 1)
-          Height = Succ->Height + 1;
+      for (std::pair<SIScheduleBlock*, enum SIScheduleBlockLinkKind> Succ : Block->getSuccs()) {
+        if (Height < Succ.first->Height + 1)
+          Height = Succ.first->Height + 1;
       }
       Block->Height = Height;
     }
@@ -1873,17 +1878,17 @@ void SIScheduleBlockScheduler::decreaseLiveRegs(SIScheduleBlock *Block,
 }
 
 void SIScheduleBlockScheduler::releaseBlockSuccs(SIScheduleBlock *Parent) {
-  for (SIScheduleBlock* Block : Parent->getSuccs()) {
-    --BlockNumPredsLeft[Block->getID()];
-    if (BlockNumPredsLeft[Block->getID()] == 0) {
-      ReadyBlocks.push_back(Block);
+  for (std::pair<SIScheduleBlock*, enum SIScheduleBlockLinkKind> Block : Parent->getSuccs()) {
+    --BlockNumPredsLeft[Block.first->getID()];
+    if (BlockNumPredsLeft[Block.first->getID()] == 0) {
+      ReadyBlocks.push_back(Block.first);
     }
     // TODO: Improve check. When the dependency between the high latency
     // instructions and the instructions of the other blocks are WAR or WAW
     // there will be no wait triggered. We would like these cases to not
     // update LastPosHighLatencyParentScheduled.
-    if (Parent->isHighLatencyBlock())
-      LastPosHighLatencyParentScheduled[Block->getID()] = NumBlockScheduled;
+    if (Parent->isHighLatencyBlock() && Block.second)
+      LastPosHighLatencyParentScheduled[Block.first->getID()] = NumBlockScheduled;
   }
 }
 
@@ -2363,7 +2368,7 @@ void SIScheduleDAGMI::schedule()
   }
 
   SIScheduler Scheduler(this);
-  Best = Scheduler.scheduleVariant(SISchedulerBlockCreatorVariant::LatenciesGrouped,
+  Best = Scheduler.scheduleVariant(SISchedulerBlockCreatorVariant::LatenciesGroupped,
                                    SISchedulerBlockSchedulerVariant::BlockLatencyRegUsage);
   SIMachineModel Model(SITII);
   BestScore = Model.getCycleCountForInstrExecInfo(Model.getInstrExecInfoForSchedule(convertToSUnits(Best.SUs), SITRI->getWaveFrontsForUsage(AMDGPUSubtarget::VOLCANIC_ISLANDS, Best.MaxSGPRUsage, Best.MaxVGPRUsage)));
