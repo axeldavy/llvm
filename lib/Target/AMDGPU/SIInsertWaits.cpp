@@ -307,7 +307,7 @@ void SIInsertWaits::pushInstruction(MachineBasicBlock &MBB,
     return;
   }
 
-  if (MBB.getParent()->getSubtarget<AMDGPUSubtarget>().getGeneration() >=
+  /*if (MBB.getParent()->getSubtarget<AMDGPUSubtarget>().getGeneration() >=
       AMDGPUSubtarget::VOLCANIC_ISLANDS) {
     // Any occurrence of consecutive VMEM or SMEM instructions forms a VMEM
     // or SMEM clause, respectively.
@@ -330,7 +330,7 @@ void SIInsertWaits::pushInstruction(MachineBasicBlock &MBB,
       LastOpcodeType = SMEM;
     else if (Increment.Named.VM)
       LastOpcodeType = VMEM;
-  }
+  }*/
 
   // Remember which export instructions we have seen
   if (Increment.Named.EXP) {

@@ -171,6 +171,7 @@ SIMachineModel::getInstrExecInfoForSchedule(std::vector<SUnit*> Schedule, unsign
     struct SIInstrExecInfo Info;
     enum SIInstructionType Type;
     unsigned Latency, Access;
+    unsigned lattype = 0;
 
     NextCycle = CurCycle;
     // Has Parent in Flight ? -> Wait for them
@@ -180,6 +181,7 @@ SIMachineModel::getInstrExecInfoForSchedule(std::vector<SUnit*> Schedule, unsign
         if (SuccDep.isWeak() || Succ->NodeNum >= DAGSize)
           continue;
         if (Succ->NodeNum == SU->NodeNum) {
+          lattype |= Infos[Flying.ScheduleIndex].Type <= 2 ? 1 : 2;
           if (NextCycle < Flying.ReadyCycle)
             NextCycle = Flying.ReadyCycle;
         }
@@ -192,6 +194,9 @@ SIMachineModel::getInstrExecInfoForSchedule(std::vector<SUnit*> Schedule, unsign
         struct SIInstrExecInfo InfoFlying = Infos[Flying.ScheduleIndex];
         // Some cycles hidden by the wait of other latencies
         unsigned Cycles = CurWaitCycle - CurCycle;
+        unsigned type = InfoFlying.Type <= 2 ? 1 : 2;
+        if (!(type & lattype))
+          continue;
         while (Cycles && InfoFlying.LatWait) {
           Cycles--;
           InfoFlying.LatWait--;
@@ -205,6 +210,29 @@ SIMachineModel::getInstrExecInfoForSchedule(std::vector<SUnit*> Schedule, unsign
         // The other cycles
         // Here TODO: differentiate VMEM vs SMEM
         CurWaitCycle = std::max<unsigned>(CurWaitCycle, Flying.ReadyCycle);
+        if (CurWaitCycle > NextCycle && (lattype & 2))
+          CurWaitCycle = NextCycle;
+        Infos[Flying.ScheduleIndex] = InfoFlying;
+      }
+      for (struct SIInstrExecInfoInFlight &Flying : InFlight) {
+        struct SIInstrExecInfo InfoFlying = Infos[Flying.ScheduleIndex];
+        // Some cycles hidden by the wait of other latencies
+        unsigned Cycles = CurWaitCycle - CurCycle;
+        unsigned type = InfoFlying.Type <= 2 ? 1 : 2;
+        if ((type & lattype))
+          continue;
+        while (Cycles && InfoFlying.LatWait) {
+          Cycles--;
+          InfoFlying.LatWait--;
+          InfoFlying.LatHidden++;
+        }
+        while (Cycles && InfoFlying.AccessWait) {
+          Cycles--;
+          InfoFlying.AccessWait--;
+          InfoFlying.AccessHidden++;
+        }
+        // The other cycles
+        // Here TODO: differentiate VMEM vs SMEM
         Infos[Flying.ScheduleIndex] = InfoFlying;
       }
       CurCycle = CurWaitCycle;
@@ -258,7 +286,7 @@ SIMachineModel::getInstrExecInfoForSchedule(std::vector<SUnit*> Schedule, unsign
       struct SIInstrExecInfoInFlight Flying;
       Flying.SU = SU;
       Flying.ScheduleIndex = Index;
-      Flying.ReadyCycle = CurCycle + Info.LatWait + Info.LatHidden;
+      Flying.ReadyCycle = CurCycle + Info.LatWait + Info.AccessWait;
       InFlight.push_back(Flying);
     }
   }
@@ -283,21 +311,21 @@ SIMachineModel::getInstrInfo(SUnit *SU, unsigned &Latency, unsigned &Access)
 
   if (SITII->isMUBUF(Opc) || SITII->isMTBUF(Opc) || SITII->isMIMG(Opc)) {
     if (MI->mayStore()) {
-      Latency = 100;
-      Access = 20;
+      Latency = 200;
+      Access = 40;
       return VMEMWrite;
     } else {
-      Latency = 100;
-      Access = 20;
+      Latency = 200;
+      Access = 40;
       return VMEMLoad;
     }
   } else if (SITII->isSMRD(Opc)) {
     if (MI->mayStore()) {
-      Latency = 4;
+      Latency = 1;
       Access = 1;
       return SMEMWrite;
     } else {
-      Latency = 4;
+      Latency = 1;
       Access = 1;
       return SMEMLoad;
     }
@@ -1691,6 +1719,7 @@ SIScheduleBlockScheduler::SIScheduleBlockScheduler(SIScheduleDAGMI *DAG,
     for (SIScheduleBlock* Block : BlocksScheduled) {
       dbgs() << ' ' << Block->getID();
     }
+    dbgs() << "\n";
   );
 }
 
@@ -2286,6 +2315,7 @@ void SIScheduleDAGMI::schedule()
 {
   SmallVector<SUnit*, 8> TopRoots, BotRoots;
   SIScheduleBlockResult Best, Temp;
+  unsigned BestScore, TempScore;
   DEBUG(dbgs() << "Preparing Scheduling\n");
 
   buildDAGWithRegPressure();
@@ -2336,8 +2366,41 @@ void SIScheduleDAGMI::schedule()
   Best = Scheduler.scheduleVariant(SISchedulerBlockCreatorVariant::LatenciesGrouped,
                                    SISchedulerBlockSchedulerVariant::BlockLatencyRegUsage);
   SIMachineModel Model(SITII);
-  unsigned BestScore = Model.getCycleCountForInstrExecInfo(Model.getInstrExecInfoForSchedule(convertToSUnits(Best.SUs), SITRI->getWaveFrontsForUsage(AMDGPUSubtarget::VOLCANIC_ISLANDS, Best.MaxSGPRUsage, Best.MaxVGPRUsage)));
+  BestScore = Model.getCycleCountForInstrExecInfo(Model.getInstrExecInfoForSchedule(convertToSUnits(Best.SUs), SITRI->getWaveFrontsForUsage(AMDGPUSubtarget::VOLCANIC_ISLANDS, Best.MaxSGPRUsage, Best.MaxVGPRUsage)));
   DEBUG(dbgs() << "Score:" << BestScore << "\n");
+
+  //Temp = Scheduler.scheduleVariant(SISchedulerBlockCreatorVariant::LatenciesAlone,
+  //                                 SISchedulerBlockSchedulerVariant::BlockLatencyRegUsage);
+  //unsigned TempScore = Model.getCycleCountForInstrExecInfo(Model.getInstrExecInfoForSchedule(convertToSUnits(Temp.SUs), SITRI->getWaveFrontsForUsage(AMDGPUSubtarget::VOLCANIC_ISLANDS, Temp.MaxSGPRUsage, Temp.MaxVGPRUsage)));
+  //DEBUG(dbgs() << "Score2:" << TempScore << "\n");
+  //if (TempScore < BestScore) {
+  //  Best = Temp;
+  //  BestScore = TempScore;
+ // }
+
+  if (1) {
+    std::vector<std::pair<SISchedulerBlockCreatorVariant, SISchedulerBlockSchedulerVariant>> Variants = {
+      { LatenciesAlone, BlockLatencyRegUsage },
+      { LatenciesAlone, BlockRegUsageLatency },
+      { LatenciesAlone, BlockRegUsage },
+      { LatenciesGrouped, BlockLatencyRegUsage },
+      { LatenciesGrouped, BlockRegUsageLatency },
+      { LatenciesGrouped, BlockRegUsage },
+      { LatenciesAlonePlusConsecutive, BlockLatencyRegUsage },
+      { LatenciesAlonePlusConsecutive, BlockRegUsageLatency },
+      { LatenciesAlonePlusConsecutive, BlockRegUsage }
+    };
+    for (std::pair<SISchedulerBlockCreatorVariant, SISchedulerBlockSchedulerVariant> v : Variants) {
+      Temp = Scheduler.scheduleVariant(v.first, v.second);
+      TempScore = Model.getCycleCountForInstrExecInfo(Model.getInstrExecInfoForSchedule(convertToSUnits(Temp.SUs), SITRI->getWaveFrontsForUsage(AMDGPUSubtarget::VOLCANIC_ISLANDS, Temp.MaxSGPRUsage, Temp.MaxVGPRUsage)));
+      DEBUG(dbgs() << "ScoreTemp:" << TempScore << " " << BestScore << " " << Temp.MaxVGPRUsage << " " << SITRI->getWaveFrontsForUsage(AMDGPUSubtarget::VOLCANIC_ISLANDS, Temp.MaxSGPRUsage, Temp.MaxVGPRUsage) << "\n");
+      if ((Temp.MaxVGPRUsage < 180) && (TempScore < BestScore)) {
+        Best = Temp;
+        BestScore = TempScore;
+        DEBUG(dbgs() << "-->ScoreTemp:" << TempScore << " " << BestScore << " " << Temp.MaxVGPRUsage << "\n");
+      }
+    }
+  }
 
   // if VGPR usage is extremely high, try other good performing variants
   // which could lead to lower VGPR usage
@@ -2354,10 +2417,14 @@ void SIScheduleDAGMI::schedule()
     };
     for (std::pair<SISchedulerBlockCreatorVariant, SISchedulerBlockSchedulerVariant> v : Variants) {
       Temp = Scheduler.scheduleVariant(v.first, v.second);
-      if (Temp.MaxVGPRUsage < Best.MaxVGPRUsage)
+      unsigned TempScore = Model.getCycleCountForInstrExecInfo(Model.getInstrExecInfoForSchedule(convertToSUnits(Temp.SUs), SITRI->getWaveFrontsForUsage(AMDGPUSubtarget::VOLCANIC_ISLANDS, Temp.MaxSGPRUsage, Temp.MaxVGPRUsage)));
+      if (Temp.MaxVGPRUsage < Best.MaxVGPRUsage) {
         Best = Temp;
+        BestScore = TempScore;
+      }
     }
   }
+  DEBUG(dbgs() << "ScoreChoice:" << BestScore << "\n");
   // if VGPR usage is still extremely high, we may spill. Try other variants
   // which are less performing, but that could lead to lower VGPR usage.
   if (Best.MaxVGPRUsage > 200) {

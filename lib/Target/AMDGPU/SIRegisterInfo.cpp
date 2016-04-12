@@ -47,7 +47,7 @@ SIRegisterInfo::SIRegisterInfo() : AMDGPURegisterInfo(),
                                    VGPRPressureSets(getNumRegPressureSets()) {
   unsigned NumRegPressureSets = getNumRegPressureSets();
 
-  for (unsigned i = 0; i < 10; ++i) {
+  for (unsigned i = 0; i < 9; ++i) {
     SGPRsForWaveFronts[i] = getNumSGPRsAllowed(AMDGPUSubtarget::SOUTHERN_ISLANDS, i+1);
     SGPRsForWaveFrontsVI[i] = getNumSGPRsAllowed(AMDGPUSubtarget::VOLCANIC_ISLANDS, i+1);
     VGPRsForWaveFronts[i] = getNumVGPRsAllowed(i+1);
@@ -805,12 +805,13 @@ unsigned SIRegisterInfo::getWaveFrontsForUsage(AMDGPUSubtarget::Generation gen,
       &SGPRsForWaveFrontsVI[0] : &SGPRsForWaveFronts[0];
 
   for (i = 9; i > 0; --i) {
-    if (SGPRsForWaveFrontsForGen[i] >= SGPRsUsed &&
-        VGPRsForWaveFronts[i] >= VGPRsUsed)
+    if (/*SGPRsForWaveFrontsForGen[i-1] >= SGPRsUsed &&*/
+        VGPRsForWaveFronts[i-1] >= VGPRsUsed)
       break;
   }
+  if (i==0) i = 1;
 
-  return i + 1;
+  return i;
 }
 
 unsigned SIRegisterInfo::spillCost(AMDGPUSubtarget::Generation gen,
