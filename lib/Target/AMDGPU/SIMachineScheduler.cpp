@@ -17,6 +17,9 @@
 #include "SIMachineScheduler.h"
 #include "SIRegisterInfo.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/LiveInterval.h"
 #include "llvm/CodeGen/LiveIntervalAnalysis.h"
@@ -385,6 +388,578 @@ SISchedulerRPTracker::printDebugLives()
 }
 
 #endif
+
+// Strategy to reduce register pressure:
+// Idea: Reducing register pressure is hard. Heuristics with
+// scores have failed (scores for each instruction about a "potential"
+// to release registers).
+// Instead of using heuristics, try to find a path of instructions with a
+// reduced number of instructions, such that at the end of the path the
+// number of live registers is reduced.
+//
+// Algorithm:
+// For each alive register or register not produced:
+//   -> if we need more than k instructions to consume the register, ignore.
+//   -> else compute the minimal set of registers that would be produced to
+//      schedule all the instructions needed to consume the register, idem
+//      for the set of registers that would be consumed (separate currently
+//      alive registers and intermediate registers).
+//
+// We then look at the register such that the path to consume it released the
+// most registers.
+//
+// A way to get better results would then to try doing combinations that
+// would directly give better consumed/produced ratio.
+//
+// Another way to improve would be to pick amond all the possible choices
+// the best latency-friendly path.
+
+struct SIItemInfo {
+  // All Items that have to be scheduled first + Item
+  SmallPtrSet<unsigned, 16> Dependencies;
+  // The registers that were initially defined, that
+  // scheduling both this item and its dependencies
+  // consumed.
+  DenseSet<unsigned> ConsumedRegisters;
+  // Idem for the intermediate registers (that were produced
+  // at some point, and then consumed).
+  DenseSet<unsigned> ProducedConsumedRegisters;
+  // idem for registers that were produced at some point, but
+  // are still alive.
+  DenseSet<unsigned> ProducedRegisters;
+  // Registers that were specifically eaten by this item (identical to
+  // to LiveInRegs, but in the "unique reg identifier" space).
+  DenseSet<unsigned> ItemInRegs;
+  // unique identifier -> which items in the Dependencies do eat this register
+  // We use this only to count how many times a give register, but we use
+  // set to enable union when merging several branches.
+  // Registers that are consumed are removed from the map.
+  DenseMap<unsigned, SmallPtrSet<unsigned, 16>> RegisterConsumers;
+  SIItemInfo() : Dependencies(), ConsumedRegisters(),
+  ProducedConsumedRegisters(), ProducedRegisters(), ItemInRegs(),
+  RegisterConsumers() {}
+};
+
+struct SIMIRegisterInfo {
+  // The minimal set of Items to schedule to release this register.
+  SmallPtrSet<unsigned, 16> Dependencies;
+  // The livein registers that are consumed by scheduling the Dependencies.
+  DenseSet<unsigned> ConsumedRegisters;
+  // The registers that are produced then consumed by scheduling the
+  // Dependencies.
+  DenseSet<unsigned> ProducedConsumedRegisters;
+  // The registers that are produced then consumed by scheduling the
+  // Dependencies.
+  DenseSet<unsigned> ProducedRegisters;
+  // Idem than for Items
+  DenseMap<unsigned, SmallPtrSet<unsigned, 16>> RegisterConsumers;
+  SIMIRegisterInfo() : Dependencies(), ConsumedRegisters(),
+  ProducedConsumedRegisters(), ProducedRegisters(), RegisterConsumers() {}
+#ifndef NDEBUG
+  void
+  printDebug(const MachineRegisterInfo *MRI,
+             const TargetRegisterInfo *TRI,
+             unsigned VGPRSetID,
+             unsigned SGPRSetID,
+             DenseMap<unsigned, RegisterMaskPair> &IdentifierToReg)
+  {
+    dbgs() << "Item list: ";
+    for (unsigned ID : Dependencies)
+      dbgs() << ID << " ";
+    dbgs() << '\n';
+    dbgs() << "Consumed registers: ";
+    for (unsigned Reg : ConsumedRegisters) {
+      RegisterMaskPair &RealReg = IdentifierToReg.find(Reg)->second;
+      int DiffV = 0;
+      int DiffS = 0;
+      PSetIterator PSetI = MRI->getPressureSets(RealReg.RegUnit);
+      for (; PSetI.isValid(); ++PSetI) {
+        if (*PSetI == VGPRSetID)
+          DiffV -= PSetI.getWeight();
+        if (*PSetI == SGPRSetID)
+          DiffS -= PSetI.getWeight();
+      }
+      dbgs() << PrintVRegOrUnit(RealReg.RegUnit, TRI);
+      if (!RealReg.LaneMask.all())
+        dbgs() << ':' << PrintLaneMask(RealReg.LaneMask);
+      dbgs() << "(" << DiffV << ", " << DiffS << "), ";
+    }
+    dbgs() << '\n';
+    dbgs() << "Intermediate registers: ";
+    for (unsigned Reg : ProducedConsumedRegisters) {
+      RegisterMaskPair &RealReg = IdentifierToReg.find(Reg)->second;
+      int DiffV = 0;
+      int DiffS = 0;
+      PSetIterator PSetI = MRI->getPressureSets(RealReg.RegUnit);
+      for (; PSetI.isValid(); ++PSetI) {
+        if (*PSetI == VGPRSetID)
+          DiffV += PSetI.getWeight();
+        if (*PSetI == SGPRSetID)
+          DiffS += PSetI.getWeight();
+      }
+      dbgs() << PrintVRegOrUnit(RealReg.RegUnit, TRI);
+      if (!RealReg.LaneMask.all())
+        dbgs() << ':' << PrintLaneMask(RealReg.LaneMask);
+      dbgs() << "(" << DiffV << ", " << DiffS << "), ";
+    }
+    dbgs() << '\n';
+    dbgs() << "Produced registers: ";
+    for (unsigned Reg : ProducedRegisters) {
+      RegisterMaskPair &RealReg = IdentifierToReg.find(Reg)->second;
+      int DiffV = 0;
+      int DiffS = 0;
+      PSetIterator PSetI = MRI->getPressureSets(RealReg.RegUnit);
+      for (; PSetI.isValid(); ++PSetI) {
+        if (*PSetI == VGPRSetID)
+          DiffV += PSetI.getWeight();
+        if (*PSetI == SGPRSetID)
+          DiffS += PSetI.getWeight();
+      }
+      dbgs() << PrintVRegOrUnit(RealReg.RegUnit, TRI);
+      if (!RealReg.LaneMask.all())
+        dbgs() << ':' << PrintLaneMask(RealReg.LaneMask);
+      dbgs() << "(" << DiffV << ", " << DiffS << "), ";
+    }
+    dbgs() << '\n';
+  }
+#endif
+};
+
+std::set<unsigned>
+SISchedulerRPTracker::findPathRegUsage(int SearchDepthLimit,
+                                       int VGPRDiffGoal,
+                                       int SGPRDiffGoal,
+                                       bool PriorityVGPR)
+{
+  DenseSet<unsigned> LiveRegsInitId;
+  DenseMap<unsigned, unsigned> RegsConsumers;
+
+  DenseMap<unsigned, unsigned> CountUsersPerReg;
+  DenseSet<unsigned> ConsumableRegisters;
+
+  std::vector<unsigned> ItemNumPredsLeftCurrent = ItemNumPredsLeft;
+
+  // We want an unique identifier per register, but a register can be reused
+  // (input and output of an item). We thus use a mapping
+  // "unique reg identifier" -> register,
+  // and an opposite mapping register -> current associated identifier.
+  // Similar to previously, we will say a given RegisterMaskPair is an
+  // uniquer register (by construction, the Masks for a same register
+  // don't intersect).
+  DenseMap<unsigned, RegisterMaskPair> IdentifierToReg;
+  std::map<RegisterMaskPair, unsigned> RegToIdentifier;
+  unsigned NextIdentifier = 0;
+
+  DenseMap<unsigned, SIItemInfo> ItemInfos;
+  SmallVector<unsigned, 16> SchedulableItems = ReadyItems;
+  SmallVector<unsigned, 16> SchedulableItemNextDepth;
+
+  DenseMap<unsigned, SIMIRegisterInfo> RegisterInfos;
+
+  SmallVector<unsigned, 32> Temp;
+
+  int BestDiffVGPR = INT_MAX;
+  int BestDiffSGPR = INT_MAX;
+  unsigned BestDiffReg = ~0u;
+
+  // Used to compute scores
+  SmallDenseMap<unsigned, LaneBitmask> Map;
+  SmallPtrSet<unsigned, 8> Set;
+
+  if (ReadyItems.empty())
+    return std::set<unsigned>();
+
+  DEBUG(dbgs() << "findPathRegUsage(" << SearchDepthLimit << ")\n");
+  DEBUG(dbgs() << "Initial Live regs:\n");
+
+  // Fill info for initial registers
+  for (const auto &RegP : LiveRegs) {
+    unsigned Reg = RegP.first;
+    // Ignoring physical registers
+    if (!TargetRegisterInfo::isVirtualRegister(Reg))
+      continue;
+    for (const auto RegPair : getPairsForReg(Reg, RegP.second)) {
+      (void) LiveRegsInitId.insert(NextIdentifier);
+      assert(RemainingRegsConsumers.find(RegPair) !=
+               RemainingRegsConsumers.end());
+      assert(RemainingRegsConsumers[RegPair] > 0);
+      RegsConsumers[NextIdentifier] = RemainingRegsConsumers[RegPair];
+
+      IdentifierToReg.insert(std::make_pair(NextIdentifier, RegPair));
+      RegToIdentifier[RegPair] = NextIdentifier;
+      DEBUG(dbgs() << PrintVRegOrUnit(Reg, TRI);
+            if (!RegPair.LaneMask.all())
+              dbgs() << ':' << PrintLaneMask(RegPair.LaneMask);
+            dbgs() << " (--> " << NextIdentifier << ")\n";);
+      ++NextIdentifier;
+    }
+  }
+
+  // Fill ItemInfos
+  while (SearchDepthLimit > 0 && !SchedulableItems.empty()) {
+    DEBUG(dbgs() << "Iterating... Remaining levels: " << SearchDepthLimit << '\n');
+    for (unsigned ID : SchedulableItems) {
+      SIItemInfo &ItemInfo = ItemInfos[ID];
+
+      DEBUG(dbgs() << "Computing data for Item: " << ID << '\n');
+
+      for (unsigned ParentID : ItemPreds[ID]) {
+        DenseMap<unsigned, SIItemInfo>::iterator ParentItemInfoPair =
+          ItemInfos.find(ParentID);
+        // We fill the data in a topological sorted order, thus
+        // all parents are seen before the Item. However we don't
+        // fill any data if the Parent is already scheduled.
+        if (ParentItemInfoPair != ItemInfos.end()) {
+          SIItemInfo &ParentItemInfo = ParentItemInfoPair->second;
+          // Add the dependencies of the parents
+          ItemInfo.Dependencies.insert(
+            ParentItemInfo.Dependencies.begin(),
+            ParentItemInfo.Dependencies.end());
+          // Idem for consumed and produced registers
+          ItemInfo.ConsumedRegisters.insert(
+            ParentItemInfo.ConsumedRegisters.begin(),
+            ParentItemInfo.ConsumedRegisters.end());
+          ItemInfo.ProducedConsumedRegisters.insert(
+            ParentItemInfo.ProducedConsumedRegisters.begin(),
+            ParentItemInfo.ProducedConsumedRegisters.end());
+          ItemInfo.ProducedRegisters.insert(
+            ParentItemInfo.ProducedRegisters.begin(),
+            ParentItemInfo.ProducedRegisters.end());
+          // Merge the partially consumed registers of the parents and
+          // their dependencies.
+          for (const auto &RConsumers: ParentItemInfo.RegisterConsumers) {
+            DenseMap<unsigned, SmallPtrSet<unsigned, 16>>::iterator
+              ItemRegisterConsumersI = ItemInfo.RegisterConsumers.find(RConsumers.first);
+            // Check it's filled in RegsConsumers
+            assert(RegsConsumers.find(RConsumers.first) != RegsConsumers.end());
+
+            // Note: the registers in RegisterConsumers are either in
+            // LiveRegsCurrent or in ItemInfo.ProducedRegisters.
+            // In all cases it's registers that aren't consumed yet.
+            if (ItemRegisterConsumersI == ItemInfo.RegisterConsumers.end()) {
+              // It's the first time we add the register to the list.
+              // Copy the list of consumers of the register in the parent's
+              // Dependencies list.
+              ItemInfo.RegisterConsumers[RConsumers.first] =
+                RConsumers.second;
+            }
+            else {
+              SmallPtrSet<unsigned, 16> &ItemRegisterConsumers =
+                ItemRegisterConsumersI->second;
+              // It's not the first time. Merge the lists.
+              ItemRegisterConsumers.insert(
+                RConsumers.second.begin(), RConsumers.second.end());
+              // If the register has all its consumers in the Dependencies
+              // list, move it from RegisterConsumers to the correct list.
+              if (ItemRegisterConsumers.size() ==
+                    RegsConsumers[RConsumers.first]) {
+                // Register is consumed, add to the correct list
+                // Note: the erase invalidates ItemRegisterConsumersI.
+                ItemInfo.RegisterConsumers.erase(ItemRegisterConsumersI);
+                if (LiveRegsInitId.count(RConsumers.first))
+                  ItemInfo.ConsumedRegisters.insert(RConsumers.first);
+                else {
+                  assert(ItemInfo.ProducedRegisters.find(RConsumers.first) !=
+                           ItemInfo.ProducedRegisters.end());
+                  ItemInfo.ProducedConsumedRegisters.insert(RConsumers.first);
+                  ItemInfo.ProducedRegisters.erase(RConsumers.first);
+                }
+              }
+            }
+          }
+        }
+      }
+      // At this point, we have merged the data from all parents.
+      ItemInfo.Dependencies.insert(ID);
+
+      for (const auto &RegPair : InRegsForItem[ID]) {
+        unsigned Reg = RegPair.RegUnit;
+        if (!TargetRegisterInfo::isVirtualRegister(Reg))
+          continue;
+        DEBUG(dbgs() << "InReg : " << PrintVRegOrUnit(Reg, TRI);
+              if (!RegPair.LaneMask.all())
+                dbgs() << ':' << PrintLaneMask(RegPair.LaneMask);
+              dbgs () << '\n');
+        assert(RegToIdentifier.find(RegPair) != RegToIdentifier.end());
+        unsigned RegIdentifier = RegToIdentifier[RegPair];
+        SmallPtrSet<unsigned, 16> &ItemRegisterConsumers =
+          ItemInfo.RegisterConsumers[RegIdentifier];
+
+        // Check it's filled in RegsConsumers
+        assert(RegsConsumers.find(RegIdentifier) != RegsConsumers.end());
+
+        ItemInfo.ItemInRegs.insert(RegIdentifier);
+        ++CountUsersPerReg[RegIdentifier];
+
+        ItemRegisterConsumers.insert(ID);
+        // If the register has all its consumers in the Dependencies
+        // list, move it from RegisterConsumers to the correct list.
+        if (ItemRegisterConsumers.size() == RegsConsumers[RegIdentifier]) {
+          // Register is consumed, add to the correct list
+          ItemInfo.RegisterConsumers.erase(RegIdentifier);
+          if (LiveRegsInitId.count(RegIdentifier))
+            ItemInfo.ConsumedRegisters.insert(RegIdentifier);
+          else {
+            assert(ItemInfo.ProducedRegisters.find(RegIdentifier) !=
+                           ItemInfo.ProducedRegisters.end());
+            ItemInfo.ProducedConsumedRegisters.insert(RegIdentifier);
+            ItemInfo.ProducedRegisters.erase(RegIdentifier);
+          }
+        }
+      }
+      for (const auto &RegPair : OutRegsForItem[ID]) {
+        unsigned Reg = RegPair.RegUnit;
+        if (!TargetRegisterInfo::isVirtualRegister(Reg))
+          continue;
+        // Note: By construction, we can overwrite RegToIdentifier[Reg],
+        // because we schedule in a valid order (Reg was consumed at this
+        // point).
+        unsigned RegIdentifier = NextIdentifier;
+        IdentifierToReg.insert(std::make_pair(RegIdentifier, RegPair));
+        RegToIdentifier[RegPair] = RegIdentifier;
+        DEBUG(dbgs() << "OutReg : " << PrintVRegOrUnit(Reg, TRI);
+              if (!RegPair.LaneMask.all())
+                dbgs() << ':' << PrintLaneMask(RegPair.LaneMask);
+              dbgs () << '\n');
+        ++NextIdentifier;
+
+        RegsConsumers[RegIdentifier] = OutRegsNumUsages[ID][RegPair];
+        ItemInfo.ProducedRegisters.insert(RegIdentifier);
+      }
+
+      for (unsigned ChildID : ItemSuccs[ID]) {
+        --ItemNumPredsLeftCurrent[ChildID];
+        if (ItemNumPredsLeftCurrent[ChildID] == 0) {
+          SchedulableItemNextDepth.push_back(ChildID);
+        }
+      }
+    }
+    --SearchDepthLimit;
+    SchedulableItems = SchedulableItemNextDepth;
+    SchedulableItemNextDepth.clear();
+  }
+
+  // We have now the info for each item about produced and
+  // consumed registers for the item and its dependencies.
+  // We could at this point take the item such that
+  // consumed - produced has the best score, but working on
+  // consumable registers (instead of item) gives better result.
+  // Reason is working on registers contains also some combination of
+  // items and their dependencies (to release a specific registers).
+
+  // To speed up computation, we compute RegisterInfo only for registers
+  // that can be consumed.
+  for (const auto &RegUserCount : CountUsersPerReg) {
+    assert (RegUserCount.second <= RegsConsumers[RegUserCount.first]);
+    if (RegUserCount.second == RegsConsumers[RegUserCount.first])
+      ConsumableRegisters.insert(RegUserCount.first);
+  }
+
+  // Fill RegisterInfos.
+  for (auto ItemInfoPair : ItemInfos) {
+    SIItemInfo &ItemInfo = ItemInfoPair.second;
+    for (unsigned Reg : ItemInfo.ItemInRegs) {
+      DenseMap<unsigned, SIMIRegisterInfo>::iterator RegisterInfosI;
+      if (!ConsumableRegisters.count(Reg))
+        continue;
+      RegisterInfosI = RegisterInfos.find(Reg);
+      if (RegisterInfosI == RegisterInfos.end()) {
+        SIMIRegisterInfo &RInfo = RegisterInfos[Reg];
+        RInfo.Dependencies = ItemInfo.Dependencies;
+        RInfo.ConsumedRegisters = ItemInfo.ConsumedRegisters;
+        RInfo.ProducedConsumedRegisters =
+          ItemInfo.ProducedConsumedRegisters;
+        RInfo.ProducedRegisters = ItemInfo.ProducedRegisters;
+        RInfo.RegisterConsumers = ItemInfo.RegisterConsumers;
+      }
+      else {
+        SIMIRegisterInfo &RInfo = RegisterInfosI->second;
+        RInfo.Dependencies.insert(
+          ItemInfo.Dependencies.begin(),
+          ItemInfo.Dependencies.end());
+        RInfo.ConsumedRegisters.insert(
+          ItemInfo.ConsumedRegisters.begin(),
+          ItemInfo.ConsumedRegisters.end());
+        RInfo.ProducedConsumedRegisters.insert(
+          ItemInfo.ProducedConsumedRegisters.begin(),
+          ItemInfo.ProducedConsumedRegisters.end());
+        // Contrary to items, we can have things in RInfo ProducedRegisters
+        // That are in ItemInfo *ConsumedRegisters and vice-versa
+        // -> Do the Union of everything, then fix.
+        RInfo.ProducedRegisters.insert(
+          ItemInfo.ProducedRegisters.begin(),
+          ItemInfo.ProducedRegisters.end());
+        for (const auto &RConsumers: ItemInfo.RegisterConsumers) {
+          DenseMap<unsigned, SmallPtrSet<unsigned, 16>>::iterator
+            RegisterConsumerI = RInfo.RegisterConsumers.find(RConsumers.first);
+          if (RegisterConsumerI == RInfo.RegisterConsumers.end()) {
+            RInfo.RegisterConsumers[RConsumers.first] = RConsumers.second;
+          }
+          else {
+            RegisterConsumerI->second.insert(RConsumers.second.begin(),
+                                             RConsumers.second.end());
+          }
+        }
+      }
+    }
+  }
+
+  // We have done the union of all fields, we must "fix" them by correctly
+  // detecting consumed registers.
+  for (DenseMap<unsigned, SIMIRegisterInfo>::iterator I =
+         RegisterInfos.begin(); I != RegisterInfos.end(); ++I) {
+    SIMIRegisterInfo &RInfo = I->second;
+    // Anything in the list of consumed registers need
+    // to be removed from the list of unconsumed registers.
+    for (unsigned Reg : RInfo.ConsumedRegisters) {
+      RInfo.ProducedRegisters.erase(Reg);
+      RInfo.RegisterConsumers.erase(Reg);
+    }
+    for (unsigned Reg : RInfo.ProducedConsumedRegisters) {
+      RInfo.ProducedRegisters.erase(Reg);
+      RInfo.RegisterConsumers.erase(Reg);
+    }
+    // Detect registers that are in RegisterConsumers and released.
+    Temp.clear(); // Erasing values invalidate iterator.
+    for (DenseMap<unsigned, SmallPtrSet<unsigned, 16>>::iterator I2 =
+         RInfo.RegisterConsumers.begin();
+         I2 != RInfo.RegisterConsumers.end(); ++I2) {
+      // A register is consumed if all its consumers are listed.
+      unsigned Reg = I2->first;
+      bool ToErase = I2->second.size() == RegsConsumers[Reg];
+
+      if (ToErase) {
+        Temp.push_back(I2->first);
+        if (LiveRegsInitId.count(Reg))
+          RInfo.ConsumedRegisters.insert(Reg);
+        else {
+          assert(RInfo.ProducedRegisters.find(Reg) !=
+                 RInfo.ProducedRegisters.end());
+          RInfo.ProducedConsumedRegisters.insert(Reg);
+          RInfo.ProducedRegisters.erase(Reg);
+        }
+      }
+    }
+    for (unsigned Reg : Temp) {
+      RInfo.RegisterConsumers.erase(Reg);
+    }
+  }
+
+  DEBUG(
+    for (const auto &RInfo : RegisterInfos) {
+      unsigned Reg = RInfo.first;
+      RegisterMaskPair &RealReg = IdentifierToReg.find(Reg)->second;
+      dbgs() << Reg << "(" << PrintVRegOrUnit(RealReg.RegUnit, TRI);
+      if (!RealReg.LaneMask.all())
+        dbgs() << ':' << PrintLaneMask(RealReg.LaneMask);
+      dbgs() << ")" << " :\nConsumed: ";
+      for (unsigned Reg2 : RInfo.second.ConsumedRegisters)
+        dbgs() << Reg2 << " ";
+      dbgs() << "\nProducedConsumed: ";
+      for (unsigned Reg2 : RInfo.second.ProducedConsumedRegisters)
+        dbgs() << Reg2 << " ";
+      dbgs() << "\nProduced: ";
+      for (unsigned Reg2 : RInfo.second.ProducedRegisters)
+        dbgs() << Reg2 << " ";
+      dbgs() << "\nRegisterConsumers: ";
+      for (const auto &RConsumers: RInfo.second.RegisterConsumers)
+        dbgs() << "  " << RConsumers.first << "(" << RConsumers.second.size() << ", " << RegsConsumers[RConsumers.first] << ")";
+      dbgs() << "\n\n";
+  });
+
+  // Find the best score
+  for (const auto &RInfo : RegisterInfos) {
+    int DiffVGPR = 0;
+    int DiffSGPR = 0;
+
+    Map.clear();
+    Set.clear();
+
+    for (unsigned Reg : RInfo.second.ConsumedRegisters) {
+      RegisterMaskPair &RealReg = IdentifierToReg.find(Reg)->second;
+      Map[RealReg.RegUnit] |= RealReg.LaneMask;
+    }
+
+    for (const auto &RegPair : Map) {
+      if (LiveRegs[RegPair.first] == RegPair.second) {
+        PSetIterator PSetI = MRI->getPressureSets(RegPair.first);
+        for (; PSetI.isValid(); ++PSetI) {
+          if (*PSetI == VGPRSetID)
+            DiffVGPR -= PSetI.getWeight();
+          if (*PSetI == SGPRSetID)
+            DiffSGPR -= PSetI.getWeight();
+        }
+      }
+    }
+
+    for (unsigned Reg : RInfo.second.ProducedRegisters) {
+      RegisterMaskPair &RealReg = IdentifierToReg.find(Reg)->second;
+      Set.insert(RealReg.RegUnit);
+    }
+
+    for (unsigned Reg : Set) {
+      // Check register is not already alive (at least some lanes)
+      if (LiveRegs.find(Reg) == LiveRegs.end()) {
+        PSetIterator PSetI = MRI->getPressureSets(Reg);
+        for (; PSetI.isValid(); ++PSetI) {
+          if (*PSetI == VGPRSetID)
+            DiffVGPR += PSetI.getWeight();
+          if (*PSetI == SGPRSetID)
+            DiffSGPR += PSetI.getWeight();
+        }
+      }
+    }
+
+    DEBUG(dbgs() << RInfo.first << ": diff = (" << DiffVGPR << ", "
+            << DiffSGPR << ")\n");
+    // Remove cases that don't match the target.
+    if (DiffVGPR > VGPRDiffGoal || DiffSGPR > SGPRDiffGoal)
+      continue;
+    // Priority to reduce VGPR or SGPR
+    if (PriorityVGPR) {
+      if (BestDiffVGPR > DiffVGPR) {
+        BestDiffVGPR = DiffVGPR;
+        BestDiffSGPR = DiffSGPR;
+        BestDiffReg = RInfo.first;
+      }
+      else if (BestDiffVGPR == DiffVGPR) {
+        if (BestDiffSGPR > DiffSGPR) {
+          BestDiffSGPR = DiffSGPR;
+          BestDiffReg = RInfo.first;
+        }
+      }
+    }
+    else {
+      if (BestDiffSGPR > DiffSGPR) {
+        BestDiffVGPR = DiffVGPR;
+        BestDiffSGPR = DiffSGPR;
+        BestDiffReg = RInfo.first;
+      }
+      else if (BestDiffSGPR == DiffSGPR) {
+        if (BestDiffVGPR > DiffVGPR) {
+          BestDiffVGPR = DiffVGPR;
+          BestDiffReg = RInfo.first;
+        }
+      }
+    }
+  }
+
+  // No path found
+  if (BestDiffVGPR == INT_MAX) {
+    DEBUG(dbgs() << "No good path found\n");
+    return std::set<unsigned>();
+  }
+
+  assert (RegisterInfos.size() != 0);
+
+  DEBUG(dbgs() << "Best diff score: (" << BestDiffVGPR << ", " << BestDiffSGPR
+          << ")\n");
+
+  SIMIRegisterInfo &RInfo = RegisterInfos[BestDiffReg];
+  DEBUG(RInfo.printDebug(MRI, TRI, VGPRSetID, SGPRSetID, IdentifierToReg));
+  return std::set<unsigned>(RInfo.Dependencies.begin(),
+                            RInfo.Dependencies.end());
+}
 
 SmallVector<RegisterMaskPair, 8>
 SISchedulerRPTracker::getPairsForReg(unsigned Reg, LaneBitmask Mask)
@@ -1999,10 +2574,42 @@ SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
     dbgs() << "Current SGPRs: " << SregCurrentUsage << '\n';
   );
 
+  // 200 and 70 are arbitrary thresholds.
+  // TODO: better way to set them ?
+  // If finding a path of depth 6 fails, try to find a path
+  // of depth 12.
+  if (CurrentPathRegUsage.empty()) {
+    if (VregCurrentUsage > 200) {
+      CurrentPathRegUsage = RPTracker->findPathRegUsage(6, 0, INT_MAX, true);
+      if (CurrentPathRegUsage.empty())
+        CurrentPathRegUsage = RPTracker->findPathRegUsage(12, 0, INT_MAX, true);
+    } else if (SregCurrentUsage > 70) {
+      CurrentPathRegUsage = RPTracker->findPathRegUsage(6, INT_MAX, 0, false);
+      if (CurrentPathRegUsage.empty())
+        CurrentPathRegUsage = RPTracker->findPathRegUsage(12, INT_MAX, 0, false);
+    }
+  }
+
+  DEBUG(
+    if (!CurrentPathRegUsage.empty()) {
+      dbgs() << "Restricting research among: ";
+      for (unsigned ID : ReadyBlocks) {
+        if (!CurrentPathRegUsage.count(ID))
+          continue;
+        dbgs() << ID << ' ';
+      }
+      dbgs() << '\n';
+    }
+  );
+
   Cand.Block = nullptr;
   for (unsigned ID : ReadyBlocks) {
     SIBlockSchedCandidate TryCand;
     int SGPRUsageDiff;
+
+    if (!CurrentPathRegUsage.empty() &&
+        CurrentPathRegUsage.find(ID) == CurrentPathRegUsage.end())
+      continue;
 
     TryCand.Block = Blocks[ID];
     TryCand.IsHighLatency = TryCand.Block->isHighLatencyBlock();
@@ -2043,6 +2650,8 @@ SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
   );
 
   Block = Cand.Block;
+  if (!CurrentPathRegUsage.empty())
+    CurrentPathRegUsage.erase(Block->getID());
   return Block;
 }
 

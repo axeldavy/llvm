@@ -104,6 +104,11 @@ public:
 
   void printDebugLives();
 
+  std::set<unsigned> findPathRegUsage(int SearchDepthLimit,
+                                      int VGPRDiffGoal,
+                                      int SGPRDiffGoal,
+                                      bool PriorityVGPR);
+
 private:
   // Convert Reg/Mask to a list of Reg/Mask, with Mask in
   // LaneMaskBasisForReg.
@@ -408,6 +413,8 @@ class SIScheduleBlockScheduler {
 
   std::vector<unsigned> LastPosHighLatencyParentScheduled;
   int LastPosWaitedHighLatency;
+
+  std::set<unsigned> CurrentPathRegUsage;
 
   std::vector<SIScheduleBlock*> BlocksScheduled;
   unsigned NumBlockScheduled;
