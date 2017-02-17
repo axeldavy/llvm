@@ -326,6 +326,7 @@ class SIScheduleBlockScheduler {
   std::vector<SIScheduleBlock*> BlocksScheduled;
   unsigned NumBlockScheduled;
   std::vector<SIScheduleBlock*> ReadyBlocks;
+  std::set<SIScheduleBlock*> CurrentPathRegUsage;
 
   unsigned VregCurrentUsage;
   unsigned SregCurrentUsage;
@@ -396,6 +397,10 @@ private:
                                        std::set<unsigned> &OutRegs);
 
   void schedule();
+  std::set<SIScheduleBlock *> findPathRegUsage(int SearchDepthLimit,
+                                               int VGPRDiffGoal,
+                                               int SGPRDiffGoal,
+                                               bool PriorityVGPR);
 };
 
 struct SIScheduleBlockResult {
