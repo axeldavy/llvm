@@ -463,6 +463,9 @@ void SIScheduleBlock::releaseSuccessors(SUnit *SU, bool InOrOutBlock) {
   for (SDep& Succ : SU->Succs) {
     SUnit *SuccSU = Succ.getSUnit();
 
+    if (SuccSU->NodeNum >= DAG->SUnits.size())
+      continue;
+
     if (BC->isSUInBlock(SuccSU, ID) != InOrOutBlock)
       continue;
 
@@ -2442,7 +2445,7 @@ void SIScheduleDAGMI::schedule()
   SIScheduler Scheduler(this);
   Best = Scheduler.scheduleVariant(SISchedulerBlockCreatorVariant::LatenciesAlone,
                                    SISchedulerBlockSchedulerVariant::BlockLatencyRegUsage);
-#if 0 // To enable when handleMove fix lands
+#if 1 // To enable when handleMove fix lands
   // if VGPR usage is extremely high, try other good performing variants
   // which could lead to lower VGPR usage
   if (Best.MaxVGPRUsage > 180) {
