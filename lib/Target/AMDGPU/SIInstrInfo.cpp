@@ -3731,13 +3731,13 @@ uint64_t SIInstrInfo::getScratchRsrcWords23() const {
 bool SIInstrInfo::isLowLatencyInstruction(const MachineInstr &MI) const {
   unsigned Opc = MI.getOpcode();
 
-  return isSMRD(Opc);
+  return isSMRD(Opc) || isDS(Opc);
 }
 
 bool SIInstrInfo::isHighLatencyInstruction(const MachineInstr &MI) const {
   unsigned Opc = MI.getOpcode();
 
-  return isMUBUF(Opc) || isMTBUF(Opc) || isMIMG(Opc);
+  return isMUBUF(Opc) || isMTBUF(Opc) || isMIMG(Opc) || isFLAT(Opc);
 }
 
 unsigned SIInstrInfo::isStackAccess(const MachineInstr &MI,
