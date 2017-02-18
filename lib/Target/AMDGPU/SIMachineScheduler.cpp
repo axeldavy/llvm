@@ -649,7 +649,7 @@ void SIScheduleBlockCreator::colorHighLatenciesGroups() {
   unsigned DAGSize = DAG->SUnits.size();
   unsigned NumHighLatencies = 0;
   unsigned GroupSize;
-  unsigned Color = NextReservedID;
+  int Color = NextReservedID;
   unsigned Count = 0;
   std::set<unsigned> FormingGroup;
 
@@ -673,31 +673,91 @@ void SIScheduleBlockCreator::colorHighLatenciesGroups() {
     SUnit *SU = &DAG->SUnits[i];
     if (DAG->IsHighLatencySU[SU->NodeNum]) {
       unsigned CompatibleGroup = true;
-      unsigned ProposedColor = Color;
+      int ProposedColor = Color;
+      std::vector<int> AdditionnalElements;
+
+      // We don't want to put in the same block
+      // two high latency instructions that depend
+      // on each other.
+      // One way would be to check canAddEdge
+      // in both directions, but that currently is not
+      // enough because there the high latency order is
+      // enforced (via links).
+      // Instead of look at the dependencies between the
+      // high latency instructions and deduce if it is
+      // a data dependency or not.
       for (unsigned j : FormingGroup) {
-        // TODO: Currently CompatibleGroup will always be false,
-        // because the graph enforces the load order. This
-        // can be fixed, but as keeping the load order is often
-        // good for performance that causes a performance hit (both
-        // the default scheduler and this scheduler).
-        // When this scheduler determines a good load order,
-        // this can be fixed.
-        if (!DAG->canAddEdge(SU, &DAG->SUnits[j]) ||
-            !DAG->canAddEdge(&DAG->SUnits[j], SU))
+        bool HasPath;
+        // We find a path from one of the SU to the other
+        // Note that there can be only one successful GetPath (no
+        // circular dependency).
+        std::vector<int> Path = DAG->GetTopo()->GetPath(&DAG->SUnits[j],
+                                                        SU, HasPath);
+        if (!HasPath)
+          Path = DAG->GetTopo()->GetPath(SU, &DAG->SUnits[j], HasPath);
+        if (!HasPath)
+          continue; // No dependencies between each other
+        else if (Path.size() > 5)
+          // Too many elements would be required to be added to the block.
           CompatibleGroup = false;
+        else {
+          // Check the type of dependency
+          for (unsigned k : Path) {
+            // If in the path to join the two instructions,
+            // there is another high latency instruction,
+            // or instructions colored for another block
+            // abort the merge.
+            if (DAG->IsHighLatencySU[k] ||
+                (CurrentColoring[k] != ProposedColor &&
+                 CurrentColoring[k] != 0))
+              CompatibleGroup = false;
+            for (SDep& PredDep : (&DAG->SUnits[k])->Preds) {
+              // We don't want any instruction which directly depend on another high latency
+              // on the same group. We do allow only order dependencies (WAR and WAW).
+              if (PredDep.getSUnit()->NodeNum == j &&
+                  PredDep.getKind() == llvm::SDep::Data) {
+                CompatibleGroup = false;
+                break;
+              }
+            }
+          }
+          // Same check for the SU
+          for (SDep& PredDep : SU->Preds) {
+            if (PredDep.getSUnit()->NodeNum == j &&
+                PredDep.getKind() == llvm::SDep::Data)
+             CompatibleGroup = false;
+          }
+          // Add all the required instructions to the block
+          // These cannot live in another block (because they
+          // depend (order dependency) on one of the
+          // instruction in the block, and are required for the
+          // high latency instruction we add.
+          AdditionnalElements.insert(AdditionnalElements.end(), Path.begin(), Path.end());
+        }
       }
-      if (!CompatibleGroup || ++Count == GroupSize) {
+      if (CompatibleGroup) {
+        FormingGroup.insert(SU->NodeNum);
+        for (unsigned j : AdditionnalElements)
+          CurrentColoring[j] = ProposedColor;
+        CurrentColoring[SU->NodeNum] = ProposedColor;
+        ++Count;
+      }
+      // Found one incompatible instruction,
+      // or has filled a big enough group.
+      // -> start a new one.
+      if (!CompatibleGroup) {
         FormingGroup.clear();
         Color = ++NextReservedID;
-        if (!CompatibleGroup) {
-          ProposedColor = Color;
-          FormingGroup.insert(SU->NodeNum);
-        }
-        Count = 0;
-      } else {
+        ProposedColor = Color;
         FormingGroup.insert(SU->NodeNum);
+        CurrentColoring[SU->NodeNum] = ProposedColor;
+        Count = 0;
+      } else if (Count == GroupSize) {
+        FormingGroup.clear();
+        Color = ++NextReservedID;
+        ProposedColor = Color;
+        Count = 0;
       }
-      CurrentColoring[SU->NodeNum] = ProposedColor;
     }
   }
 }
