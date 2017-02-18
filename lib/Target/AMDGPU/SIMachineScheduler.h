@@ -49,6 +49,11 @@ struct SISchedulerCandidate {
 class SIScheduleDAGMI;
 class SIScheduleBlockCreator;
 
+enum SIScheduleBlockLinkKind {
+  NoData,
+  Data
+};
+
 class SIScheduleBlock {
   SIScheduleDAGMI *DAG;
   SIScheduleBlockCreator *BC;
@@ -87,7 +92,8 @@ class SIScheduleBlock {
   unsigned ID;
 
   std::vector<SIScheduleBlock*> Preds;  // All blocks predecessors.
-  std::vector<SIScheduleBlock*> Succs;  // All blocks successors.
+  // All blocks successors, and the kind of link
+  std::vector<std::pair<SIScheduleBlock*, enum SIScheduleBlockLinkKind>> Succs;
   unsigned NumHighLatencySuccessors;
 
 public:
@@ -110,10 +116,11 @@ public:
 
   // Add block pred, which has instruction predecessor of SU.
   void addPred(SIScheduleBlock *Pred);
-  void addSucc(SIScheduleBlock *Succ);
+  void addSucc(SIScheduleBlock *Succ, enum SIScheduleBlockLinkKind Kind);
 
   const std::vector<SIScheduleBlock*>& getPreds() const { return Preds; }
-  const std::vector<SIScheduleBlock*>& getSuccs() const { return Succs; }
+  const std::vector<std::pair<SIScheduleBlock*, enum SIScheduleBlockLinkKind>>&
+    getSuccs() const { return Succs; }
 
   unsigned Height;  // Maximum topdown path length to block without outputs
   unsigned Depth;   // Maximum bottomup path length to block without inputs
