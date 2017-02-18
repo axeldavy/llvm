@@ -23,6 +23,57 @@ using namespace llvm;
 
 namespace llvm {
 
+enum SIInstructionType {
+  NoLatency = 0,
+  SMEMLoad = 1,
+  SMEMWrite = 2,
+  VMEMLoad = 3,
+  VMEMWrite = 4
+};
+
+const unsigned NumSIInstructionType = 5;
+
+// Stats for an instruction in a given schedule.
+struct SIInstrExecInfo {
+  enum SIInstructionType Type;
+  unsigned LatWait; // Wait caused by the intrinsical latency of the instruction.
+  unsigned AccessWait; // Idem for the time required to access memory
+  unsigned LatHidden; // Total instrical latency - LatWait
+  unsigned AccessHidden; // Idem for the time required to access memory
+};
+
+// Intrinsical instruction latency: Number of cycles needed for the instruction
+// to execute, assuming free memory access. It is divided by the wavecount.
+// Memory Access time: Number of cycles needed to fetch the memory result.
+// We assume for a same instruction type (reading or writing same memory area)
+// that it has to wait previous accesses to finish. Thus this is not divided by
+// the wavecount.
+
+class SIMachineModel {
+  const SIInstrInfo *SITII;
+
+public:
+  SIMachineModel(const SIInstrInfo *SITII):
+    SITII(SITII) {};
+  ~SIMachineModel() {};
+
+  std::vector<enum SIInstructionType>
+  getInstrTypes(std::vector<SUnit*> SUs);
+
+  // TODO: Add more refinement, determine based on schedule
+  // what types need to have their latency hidden in priority
+  std::vector<enum SIInstructionType> getHighLatencyTypes();
+  std::vector<enum SIInstructionType> getLowLatencyTypes();
+
+  std::vector<struct SIInstrExecInfo>
+  getInstrExecInfoForSchedule(std::vector<SUnit*> Schedule, unsigned ExpectedWavecount);
+
+  unsigned getCycleCountForInstrExecInfo(std::vector<struct SIInstrExecInfo> InstrsInfo);
+
+private:
+  enum SIInstructionType getInstrInfo(SUnit *SU, unsigned &Latency, unsigned &Access);
+};
+
 enum SIScheduleCandReason {
   NoCand,
   RegUsage,
@@ -313,6 +364,7 @@ private:
 
 enum SISchedulerBlockSchedulerVariant {
   BlockLatencyRegUsage,
+  BlockLatencyRegUsage2,
   BlockRegUsageLatency,
   BlockRegUsage
 };
@@ -491,6 +543,12 @@ private:
   void topologicalSort();
   // After scheduling is done, improve low latency placements.
   void moveLowLatencies();
+  std::vector<SUnit *> convertToSUnits(std::vector<unsigned> Indexes) {
+    std::vector<SUnit *> Ret;
+    for (unsigned i : Indexes)
+      Ret.push_back(&SUnits[i]);
+    return Ret;
+  }
 
 public:
   // Some stats for scheduling inside blocks.

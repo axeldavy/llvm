@@ -120,6 +120,221 @@ using namespace llvm;
 // 300-600 cycles. We do not specially take that into account when scheduling
 // As we expect the driver to be able to preload the constants soon.
 
+// SIMachineModel //
+
+std::vector<enum SIInstructionType>
+SIMachineModel::getInstrTypes(std::vector<SUnit*> SUs)
+{
+  std::vector<enum SIInstructionType> Types;
+  unsigned Latency, Access;
+
+  for (SUnit* SU : SUs)
+    Types.push_back(getInstrInfo(SU, Latency, Access));
+
+  return Types;
+}
+
+std::vector<enum SIInstructionType>
+SIMachineModel::getHighLatencyTypes()
+{
+  std::vector<enum SIInstructionType> Ret;
+  Ret.push_back(VMEMLoad);
+  Ret.push_back(VMEMWrite);
+  return Ret;
+}
+
+std::vector<enum SIInstructionType>
+SIMachineModel::getLowLatencyTypes()
+{
+  std::vector<enum SIInstructionType> Ret;
+  Ret.push_back(SMEMLoad);
+  Ret.push_back(SMEMWrite);
+  return Ret;
+}
+
+struct SIInstrExecInfoInFlight {
+  SUnit *SU;
+  unsigned ScheduleIndex;
+  unsigned ReadyCycle;
+};
+
+std::vector<struct SIInstrExecInfo>
+SIMachineModel::getInstrExecInfoForSchedule(std::vector<SUnit*> Schedule, unsigned ExpectedWavecount) {
+  std::vector<struct SIInstrExecInfo> Infos;
+  std::vector<struct SIInstrExecInfoInFlight> InFlight;
+  unsigned CurCycle = 0;
+  unsigned DAGSize = Schedule.size();
+
+  for (unsigned Index = 0; Index < DAGSize; Index++) {
+    SUnit* SU = Schedule[Index];
+    unsigned NextCycle;
+    struct SIInstrExecInfo Info;
+    enum SIInstructionType Type;
+    unsigned Latency, Access;
+    unsigned lattype = 0;
+
+    NextCycle = CurCycle;
+    // Has Parent in Flight ? -> Wait for them (if data dependency)
+    for (struct SIInstrExecInfoInFlight &Flying : InFlight) {
+      for (SDep& SuccDep : Flying.SU->Preds) {
+        SUnit *Succ = SuccDep.getSUnit();
+        if (SuccDep.isCtrl()|| Succ->NodeNum >= DAGSize)
+          continue;
+        if (Succ->NodeNum == SU->NodeNum) {
+          lattype |= Infos[Flying.ScheduleIndex].Type <= 2 ? 1 : 2;
+          if (NextCycle < Flying.ReadyCycle)
+            NextCycle = Flying.ReadyCycle;
+        }
+      }
+    }
+    // Update Instructions in Flight
+    if (NextCycle > CurCycle) {
+      unsigned CurWaitCycle = CurCycle;
+      for (struct SIInstrExecInfoInFlight &Flying : InFlight) {
+        struct SIInstrExecInfo InfoFlying = Infos[Flying.ScheduleIndex];
+        // Some cycles hidden by the wait of other latencies
+        unsigned Cycles = CurWaitCycle - CurCycle;
+        unsigned type = InfoFlying.Type <= 2 ? 1 : 2;
+        if (!(type & lattype))
+          continue;
+        while (Cycles && InfoFlying.LatWait) {
+          Cycles--;
+          InfoFlying.LatWait--;
+          InfoFlying.LatHidden++;
+        }
+        while (Cycles && InfoFlying.AccessWait) {
+          Cycles--;
+          InfoFlying.AccessWait--;
+          InfoFlying.AccessHidden++;
+        }
+        // The other cycles
+        // Here TODO: differentiate VMEM vs SMEM
+        CurWaitCycle = std::max<unsigned>(CurWaitCycle, Flying.ReadyCycle);
+        if (CurWaitCycle > NextCycle && (lattype & 2))
+          CurWaitCycle = NextCycle;
+        Infos[Flying.ScheduleIndex] = InfoFlying;
+      }
+      for (struct SIInstrExecInfoInFlight &Flying : InFlight) {
+        struct SIInstrExecInfo InfoFlying = Infos[Flying.ScheduleIndex];
+        // Some cycles hidden by the wait of other latencies
+        unsigned Cycles = CurWaitCycle - CurCycle;
+        unsigned type = InfoFlying.Type <= 2 ? 1 : 2;
+        if ((type & lattype))
+          continue;
+        while (Cycles && InfoFlying.LatWait) {
+          Cycles--;
+          InfoFlying.LatWait--;
+          InfoFlying.LatHidden++;
+        }
+        while (Cycles && InfoFlying.AccessWait) {
+          Cycles--;
+          InfoFlying.AccessWait--;
+          InfoFlying.AccessHidden++;
+        }
+        // The other cycles
+        // Here TODO: differentiate VMEM vs SMEM
+        Infos[Flying.ScheduleIndex] = InfoFlying;
+      }
+      CurCycle = CurWaitCycle;
+      assert(CurCycle >= NextCycle);
+    }
+
+    // Execute the instruction
+    NextCycle = CurCycle + 1; // TODO: take into account when it takes 4
+
+    // Update Instructions in Flight
+    for (struct SIInstrExecInfoInFlight &Flying : InFlight) {
+      struct SIInstrExecInfo InfoFlying = Infos[Flying.ScheduleIndex];
+      unsigned Cycles = NextCycle - CurCycle;
+
+      if (Flying.ReadyCycle <= CurCycle)
+        continue;
+
+      while (Cycles && InfoFlying.LatWait) {
+        Cycles--;
+        InfoFlying.LatWait--;
+        InfoFlying.LatHidden++;
+      }
+      while (Cycles && InfoFlying.AccessWait) {
+        Cycles--;
+        InfoFlying.AccessWait--;
+        InfoFlying.AccessHidden++;
+      }
+      Infos[Flying.ScheduleIndex] = InfoFlying;
+    }
+
+    CurCycle = NextCycle;
+
+    // Clean
+    for (unsigned i = InFlight.size(); i >= 1; i--) {
+      struct SIInstrExecInfoInFlight Flying = InFlight[i-1];
+
+      if (Flying.ReadyCycle <= CurCycle)
+        InFlight.erase(InFlight.begin() + (i-1));
+    }
+
+    Type = getInstrInfo(SU, Latency, Access);
+
+    Info.Type = Type;
+    Info.LatWait = Latency/ExpectedWavecount;
+    Info.AccessWait = Access;
+    Info.LatHidden = 0;
+    Info.AccessHidden = 0;
+    Infos.push_back(Info);
+    // Add new ones
+    if (Type != NoLatency) {
+      struct SIInstrExecInfoInFlight Flying;
+      Flying.SU = SU;
+      Flying.ScheduleIndex = Index;
+      Flying.ReadyCycle = CurCycle + Info.LatWait + Info.AccessWait;
+      InFlight.push_back(Flying);
+    }
+  }
+
+  return Infos;
+}
+
+unsigned SIMachineModel::getCycleCountForInstrExecInfo(std::vector<struct SIInstrExecInfo> InstrsInfo) {
+  unsigned Score = 0;
+
+  for (struct SIInstrExecInfo &Info : InstrsInfo)
+    Score += Info.LatWait + Info.AccessWait;
+
+  return Score;
+}
+
+enum SIInstructionType
+SIMachineModel::getInstrInfo(SUnit *SU, unsigned &Latency, unsigned &Access)
+{
+  const MachineInstr *MI = SU->getInstr();
+  unsigned Opc = MI->getOpcode();
+
+  if (SITII->isMUBUF(Opc) || SITII->isMTBUF(Opc) || SITII->isMIMG(Opc)) {
+    if (MI->mayStore()) {
+      Latency = 200;
+      Access = 40;
+      return VMEMWrite;
+    } else {
+      Latency = 200;
+      Access = 40;
+      return VMEMLoad;
+    }
+  } else if (SITII->isSMRD(Opc)) {
+    if (MI->mayStore()) {
+      Latency = 1;
+      Access = 1;
+      return SMEMWrite;
+    } else {
+      Latency = 1;
+      Access = 1;
+      return SMEMLoad;
+    }
+  }
+
+  Latency = 0;
+  Access = 0;
+  return NoLatency;
+}
 
 // common code //
 
@@ -1599,9 +1814,9 @@ SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
       CurrentPathRegUsage = findPathRegUsage(6, INT_MAX, 0, false);
       if (CurrentPathRegUsage.empty())
         CurrentPathRegUsage = findPathRegUsage(12, INT_MAX, 0, false);
-    }/* else if (VregCurrentUsage > 50) {
+    } else if (VregCurrentUsage > 40 && Variant == SISchedulerBlockSchedulerVariant::BlockLatencyRegUsage2) {
       CurrentPathRegUsage = findPathRegUsage(6, 0, std::max<int>(0, 70 - SregCurrentUsage), true);
-    }*/
+    }
   }
 
   DEBUG(
@@ -1639,7 +1854,8 @@ SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
     TryCand.Height = TryCand.Block->Height;
     // Try not to increase VGPR usage too much, else we may spill.
     if (VregCurrentUsage > 120 ||
-        Variant != SISchedulerBlockSchedulerVariant::BlockLatencyRegUsage) {
+        (Variant != SISchedulerBlockSchedulerVariant::BlockLatencyRegUsage &&
+         Variant != SISchedulerBlockSchedulerVariant::BlockLatencyRegUsage2)) {
       if (!tryCandidateRegUsage(Cand, TryCand) &&
           Variant != SISchedulerBlockSchedulerVariant::BlockRegUsage)
         tryCandidateLatency(Cand, TryCand);
@@ -2534,8 +2750,37 @@ void SIScheduleDAGMI::schedule()
   }
 
   SIScheduler Scheduler(this);
-  Best = Scheduler.scheduleVariant(SISchedulerBlockCreatorVariant::LatenciesAlone,
-                                   SISchedulerBlockSchedulerVariant::BlockLatencyRegUsage);
+  SIMachineModel Model(SITII);
+  unsigned BestScore = INT_MAX;
+
+  std::vector<std::pair<SISchedulerBlockCreatorVariant, SISchedulerBlockSchedulerVariant>> Variants_main = {
+      { LatenciesGrouped, BlockLatencyRegUsage },
+      { LatenciesGrouped, BlockLatencyRegUsage2 },
+      { LatenciesAlone, BlockLatencyRegUsage },
+      { LatenciesAlone, BlockLatencyRegUsage2 },
+      { LatenciesAlonePlusConsecutive, BlockLatencyRegUsage2 },
+      { LatenciesAlonePlusConsecutive, BlockLatencyRegUsage }
+    };
+    for (std::pair<SISchedulerBlockCreatorVariant, SISchedulerBlockSchedulerVariant> v : Variants_main) {
+      unsigned Score;
+      Temp = Scheduler.scheduleVariant(v.first, v.second);
+      Score = Model.getCycleCountForInstrExecInfo(
+        Model.getInstrExecInfoForSchedule(convertToSUnits(Temp.SUs),
+                                          SITRI->getWaveFrontsForUsage(AMDGPUSubtarget::VOLCANIC_ISLANDS,
+                                                                       Temp.MaxSGPRUsage, Temp.MaxVGPRUsage)));
+      Score += 10 * SITRI->spillCost(AMDGPUSubtarget::VOLCANIC_ISLANDS, Temp.MaxSGPRUsage, Temp.MaxVGPRUsage);
+      DEBUG(dbgs() << "Score: " << Score << '\n');
+      if (Score < BestScore) {
+        Best = Temp;
+        BestScore = Score;
+      }
+      // We won't find better.
+      if (BestScore == 0)
+        break;
+    }
+
+  DEBUG(dbgs() << "Best Score: " << BestScore << '\n');
+
 #if 1 // To enable when handleMove fix lands
   // if VGPR usage is extremely high, try other good performing variants
   // which could lead to lower VGPR usage
