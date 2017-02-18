@@ -478,6 +478,12 @@ public:
     return InRegs;
   };
 
+  std::set<unsigned> getOutRegs() {
+    std::set<unsigned> OutRegs (RPTracker.getPressure().LiveOutRegs.begin(),
+                                RPTracker.getPressure().LiveOutRegs.end());
+    return OutRegs;
+  };
+
   unsigned getVGPRSetID() const { return VGPRSetID; }
   unsigned getSGPRSetID() const { return SGPRSetID; }
 
