@@ -1869,8 +1869,7 @@ SIScheduleBlockScheduler::findPathRegUsage(int SearchDepthLimit,
       continue;
     (void) LiveRegsInitId.insert(CurrentIdentifier);
     assert(LiveRegsConsumers.find(Reg) != LiveRegsConsumers.end());
-    // Note: It's possible to have LiveRegsConsumers[Reg] == 0, for live
-    // regs that are not consumed in this llvm scheduling region.
+    assert(LiveRegsConsumers[Reg] > 0);
     RegsConsumers[CurrentIdentifier] = LiveRegsConsumers[Reg];
 
     IdentifierToReg[CurrentIdentifier] =
