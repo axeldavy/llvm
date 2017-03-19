@@ -16,10 +16,12 @@
 #define LLVM_LIB_TARGET_AMDGPU_SIMACHINESCHEDULER_H
 
 #include "SIInstrInfo.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineScheduler.h"
 #include "llvm/CodeGen/RegisterPressure.h"
 #include "llvm/CodeGen/ScheduleDAG.h"
+#include "llvm/MC/LaneBitmask.h"
 #include <cassert>
 #include <cstdint>
 #include <map>
@@ -28,6 +30,98 @@
 #include <vector>
 
 namespace llvm {
+
+class SISchedulerRPTracker {
+  const MachineRegisterInfo *MRI;
+  const TargetRegisterInfo *TRI;
+  unsigned VGPRSetID, SGPRSetID;
+
+  // Register -> Base of LaneBitmask to describe all possible
+  // LaneBitmask used by Items Ins and Outs.
+  // Except specified otherwise, RegisterMaskPairs in this class
+  // are always having the LaneMask be one of the element of
+  // LaneMaskBasisForReg[Reg]
+  std::map<unsigned, SmallVector<LaneBitmask, 8>> LaneMaskBasisForReg;
+
+  //   Static information about the Items:
+
+  // Index of Item Successors or Predecessors.
+  std::vector<SmallVector<unsigned, 8>> ItemSuccs;
+  std::vector<SmallVector<unsigned, 8>> ItemPreds;
+
+  std::vector<unsigned> TopoIndexToItem;
+  std::vector<unsigned> TopoItemToIndex;
+
+  // Blocks's getInRegs, but with RegisterMaskPair with Mask
+  // in LaneMaskBasisForReg[Reg] if exists.
+  std::vector<SmallVector<RegisterMaskPair, 8>> InRegsForItem;
+  std::vector<SmallVector<RegisterMaskPair, 8>> OutRegsForItem;
+
+  // Item num -> Number of usages for each Item output.
+  std::vector<std::map<RegisterMaskPair, unsigned>> OutRegsNumUsages;
+
+  //   Variable information during the schedule:
+
+  // Items ready for schedule
+  SmallVector<unsigned, 16> ReadyItems;
+
+  // Current live regs, and the valid LaneBitmask
+  std::map<unsigned, LaneBitmask> LiveRegs;
+
+  // Number of schedulable unscheduled blocks reading the register.
+  std::map<RegisterMaskPair, unsigned> RemainingRegsConsumers;
+
+  std::vector<unsigned> ItemNumPredsLeft;
+
+  unsigned CurrentVGPRUsage, CurrentSGPRUsage;
+
+public:
+  // Here the RegisterMaskPair can have arbitrary LaneMask (not
+  // elements of LaneMaskBasisForReg, which is not yet built).
+  SISchedulerRPTracker(
+    const SmallVectorImpl<RegisterMaskPair> &LiveIns,
+    const SmallVectorImpl<RegisterMaskPair> &LiveOuts,
+    const std::vector<SmallVector<unsigned, 8>> &ItemSuccs,
+    const std::vector<SmallVector<unsigned, 8>> &ItemPreds,
+    const std::vector<SmallVector<RegisterMaskPair, 8>> &InRegsForItem_,
+    const std::vector<SmallVector<RegisterMaskPair, 8>> &OutRegsForItem_,
+    const MachineRegisterInfo *MRI,
+    const TargetRegisterInfo *TRI,
+    unsigned VGPRSetID,
+    unsigned SGPRSetID
+  );
+
+  void itemScheduled(unsigned ID);
+
+  const SmallVector<unsigned, 16> &getReadyItems() {
+    return ReadyItems;
+  }
+
+  void getCurrentRegUsage(unsigned &VGPR, unsigned &SGPR);
+  // Check register pressure change
+  // by scheduling a item
+  void checkRegUsageImpact(unsigned ID, int &DiffVGPR, int &DiffSGPR);
+
+  void printDebugLives();
+
+private:
+  // Convert Reg/Mask to a list of Reg/Mask, with Mask in
+  // LaneMaskBasisForReg.
+  SmallVector<RegisterMaskPair, 8> getPairsForReg(unsigned Reg,
+                                                  LaneBitmask Mask);
+  // ToAppend: where to append the result.
+  void getPairsForReg(SmallVector<RegisterMaskPair, 8> &ToAppend,
+                      unsigned Reg, LaneBitmask Mask);
+  // Idem for a list of Reg/Mask
+  SmallVector<RegisterMaskPair, 8> getPairsForRegs(
+    const SmallVectorImpl<RegisterMaskPair> &Regs);
+
+  void fillTopoData();
+
+  void addLiveRegs(const SmallVectorImpl<RegisterMaskPair> &Regs);
+  void decreaseLiveRegs(const SmallVectorImpl<RegisterMaskPair> &Regs);
+  void releaseItemSuccs(unsigned ID);
+};
 
 enum SIScheduleCandReason {
   NoCand,
@@ -63,14 +157,11 @@ class SIScheduleBlock {
   SIScheduleDAGMI *DAG;
   SIScheduleBlockCreator *BC;
 
+  std::unique_ptr<SISchedulerRPTracker> RPTracker;
+
   std::vector<SUnit*> SUnits;
   std::map<unsigned, unsigned> NodeNum2Index;
-  std::vector<SUnit*> TopReadySUs;
   std::vector<SUnit*> ScheduledSUnits;
-
-  /// The top of the unscheduled zone.
-  IntervalPressure TopPressure;
-  RegPressureTracker TopRPTracker;
 
   // Pressure: number of said class of registers needed to
   // store the live virtual and real registers.
@@ -78,17 +169,18 @@ class SIScheduleBlock {
   // Pressure of additional registers required inside the block.
   std::vector<unsigned> InternalAdditionnalPressure;
   // Pressure of input and output registers
-  std::vector<unsigned> LiveInPressure;
-  std::vector<unsigned> LiveOutPressure;
+  unsigned LiveInVGPRPressure;
+  unsigned LiveInSGPRPressure;
+  unsigned LiveOutVGPRPressure;
+  unsigned LiveOutSGPRPressure;
   // Registers required by the block, and outputs.
   // We do track only virtual registers.
   // Note that some registers are not 32 bits,
   // and thus the pressure is not equal
   // to the number of live registers.
-  std::set<unsigned> LiveInRegs;
-  std::set<unsigned> LiveOutRegs;
+  SmallVector<RegisterMaskPair, 8> LiveInRegs;
+  SmallVector<RegisterMaskPair, 8> LiveOutRegs;
 
-  bool Scheduled = false;
   bool HighLatencyBlock = false;
 
   std::vector<unsigned> HasLowLatencyNonWaitedParent;
@@ -104,7 +196,9 @@ class SIScheduleBlock {
 public:
   SIScheduleBlock(SIScheduleDAGMI *DAG, SIScheduleBlockCreator *BC,
                   unsigned ID):
-    DAG(DAG), BC(BC), TopRPTracker(TopPressure), ID(ID) {}
+    DAG(DAG), BC(BC), LiveInVGPRPressure(0), LiveInSGPRPressure(0),
+    LiveOutVGPRPressure(0), LiveOutSGPRPressure(0), LiveInRegs(),
+    LiveOutRegs(), ID(ID) {}
 
   ~SIScheduleBlock() = default;
 
@@ -113,12 +207,14 @@ public:
   /// Functions for Block construction.
   void addUnit(SUnit *SU);
 
-  // When all SUs have been added.
-  void finalizeUnits();
+  // When all SUs have been added, and liveIns/Outs computed.
+  void finalize();
 
   // Add block pred, which has instruction predecessor of SU.
   void addPred(SIScheduleBlock *Pred);
   void addSucc(SIScheduleBlock *Succ, SIScheduleBlockLinkKind Kind);
+  void addLiveIns(SmallVector<RegisterMaskPair, 8> Ins);
+  void addLiveOuts(SmallVector<RegisterMaskPair, 8> Outs);
 
   const std::vector<SIScheduleBlock*>& getPreds() const { return Preds; }
   ArrayRef<std::pair<SIScheduleBlock*, SIScheduleBlockLinkKind>>
@@ -138,22 +234,7 @@ public:
   // are 4 times slower.
   int getCost() { return SUnits.size(); }
 
-  // The block Predecessors and Successors must be all registered
-  // before fastSchedule().
-  // Fast schedule with no particular requirement.
-  void fastSchedule();
-
   std::vector<SUnit*> getScheduledUnits() { return ScheduledSUnits; }
-
-  // Complete schedule that will try to minimize reg pressure and
-  // low latencies, and will fill liveins and liveouts.
-  // Needs all MIs to be grouped between BeginBlock and EndBlock.
-  // The MIs can be moved after the scheduling,
-  // it is just used to allow correct track of live registers.
-  void schedule(MachineBasicBlock::iterator BeginBlock,
-                MachineBasicBlock::iterator EndBlock);
-
-  bool isScheduled() { return Scheduled; }
 
   // Needs the block to be scheduled inside
   // TODO: find a way to compute it.
@@ -161,8 +242,13 @@ public:
     return InternalAdditionnalPressure;
   }
 
-  std::set<unsigned> &getInRegs() { return LiveInRegs; }
-  std::set<unsigned> &getOutRegs() { return LiveOutRegs; }
+  const SmallVector<RegisterMaskPair, 8> &getInRegs() const {
+    return LiveInRegs;
+  }
+
+  const SmallVector<RegisterMaskPair, 8> &getOutRegs() const {
+    return LiveOutRegs;
+  }
 
   void printDebug(bool Full);
 
@@ -194,21 +280,12 @@ private:
     }
   };
 
-  void undoSchedule();
-
-  void undoReleaseSucc(SUnit *SU, SDep *SuccEdge);
-  void releaseSucc(SUnit *SU, SDep *SuccEdge);
-  // InOrOutBlock: restrict to links pointing inside the block (true),
-  // or restrict to links pointing outside the block (false).
-  void releaseSuccessors(SUnit *SU, bool InOrOutBlock);
-
   void nodeScheduled(SUnit *SU);
   void tryCandidateTopDown(SISchedCandidate &Cand, SISchedCandidate &TryCand);
   void tryCandidateBottomUp(SISchedCandidate &Cand, SISchedCandidate &TryCand);
   SUnit* pickNode();
   void traceCandidate(const SISchedCandidate &Cand);
-  void initRegPressure(MachineBasicBlock::iterator BeginBlock,
-                       MachineBasicBlock::iterator EndBlock);
+  void schedule();
 };
 
 struct SIScheduleBlocks {
@@ -306,9 +383,14 @@ private:
 
   void topologicalSort();
 
-  void scheduleInsideBlocks();
-
   void fillStats();
+
+  LaneBitmask getLaneBitmaskForDef(const SUnit *SU, unsigned Reg);
+  LaneBitmask getLaneBitmaskForUse(const SUnit *SU, unsigned Reg);
+  void removeUseFromDef(SmallVectorImpl<RegisterMaskPair> &Uses,
+                        unsigned Reg, const SUnit *SU);
+  void addDefFromUse(SmallVectorImpl<RegisterMaskPair> &Defs,
+                     unsigned Reg, const SUnit *SUDef, const SUnit *SUUse);
 };
 
 enum SISchedulerBlockSchedulerVariant {
@@ -322,27 +404,17 @@ class SIScheduleBlockScheduler {
   SISchedulerBlockSchedulerVariant Variant;
   std::vector<SIScheduleBlock*> Blocks;
 
-  std::vector<std::map<unsigned, unsigned>> LiveOutRegsNumUsages;
-  std::set<unsigned> LiveRegs;
-  // Num of schedulable unscheduled blocks reading the register.
-  std::map<unsigned, unsigned> LiveRegsConsumers;
+  std::unique_ptr<SISchedulerRPTracker> RPTracker;
 
   std::vector<unsigned> LastPosHighLatencyParentScheduled;
   int LastPosWaitedHighLatency;
 
   std::vector<SIScheduleBlock*> BlocksScheduled;
   unsigned NumBlockScheduled;
-  std::vector<SIScheduleBlock*> ReadyBlocks;
-
-  unsigned VregCurrentUsage;
-  unsigned SregCurrentUsage;
 
   // Currently is only approximation.
   unsigned maxVregUsage;
   unsigned maxSregUsage;
-
-  std::vector<unsigned> BlockNumPredsLeft;
-  std::vector<unsigned> BlockNumSuccsLeft;
 
 public:
   SIScheduleBlockScheduler(SIScheduleDAGMI *DAG,
@@ -356,6 +428,7 @@ public:
   unsigned getSGPRUsage() { return maxSregUsage; }
 
 private:
+
   struct SIBlockSchedCandidate : SISchedulerCandidate {
     // The best Block candidate.
     SIScheduleBlock *Block = nullptr;
@@ -391,15 +464,7 @@ private:
                             SIBlockSchedCandidate &TryCand);
   SIScheduleBlock *pickBlock();
 
-  void addLiveRegs(std::set<unsigned> &Regs);
-  void decreaseLiveRegs(SIScheduleBlock *Block, std::set<unsigned> &Regs);
-  void releaseBlockSuccs(SIScheduleBlock *Parent);
   void blockScheduled(SIScheduleBlock *Block);
-
-  // Check register pressure change
-  // by scheduling a block with these LiveIn and LiveOut.
-  std::vector<int> checkRegUsageImpact(std::set<unsigned> &InRegs,
-                                       std::set<unsigned> &OutRegs);
 
   void schedule();
 };
@@ -445,46 +510,28 @@ public:
   // Entry point for the schedule.
   void schedule() override;
 
-  // To init Block's RPTracker.
-  void initRPTracker(RegPressureTracker &RPTracker) {
-    RPTracker.init(&MF, RegClassInfo, LIS, BB, RegionBegin, false, false);
-  }
-
   MachineBasicBlock *getBB() { return BB; }
   MachineBasicBlock::iterator getCurrentTop() { return CurrentTop; }
   MachineBasicBlock::iterator getCurrentBottom() { return CurrentBottom; }
   LiveIntervals *getLIS() { return LIS; }
   MachineRegisterInfo *getMRI() { return &MRI; }
   const TargetRegisterInfo *getTRI() { return TRI; }
-  ScheduleDAGTopologicalSort *GetTopo() { return &Topo; }
+  ScheduleDAGTopologicalSort *getTopo() { return &Topo; }
   SUnit& getEntrySU() { return EntrySU; }
   SUnit& getExitSU() { return ExitSU; }
 
-  void restoreSULinksLeft();
-
-  template<typename _Iterator> void fillVgprSgprCost(_Iterator First,
-                                                     _Iterator End,
-                                                     unsigned &VgprUsage,
-                                                     unsigned &SgprUsage);
-
-  std::set<unsigned> getInRegs() {
-    std::set<unsigned> InRegs;
-    for (const auto &RegMaskPair : RPTracker.getPressure().LiveInRegs) {
-      InRegs.insert(RegMaskPair.RegUnit);
-    }
-    return InRegs;
+  const SmallVector<RegisterMaskPair, 8> &getInRegs() const {
+    return RPTracker.getPressure().LiveInRegs;
   }
 
-  std::set<unsigned> getOutRegs() {
-    std::set<unsigned> OutRegs;
-    for (const auto &RegMaskPair : RPTracker.getPressure().LiveOutRegs) {
-      OutRegs.insert(RegMaskPair.RegUnit);
-    }
-    return OutRegs;
+  const SmallVector<RegisterMaskPair, 8> &getOutRegs() const {
+    return RPTracker.getPressure().LiveOutRegs;
   };
 
   unsigned getVGPRSetID() const { return VGPRSetID; }
   unsigned getSGPRSetID() const { return SGPRSetID; }
+
+  bool shouldTrackLaneMasks() const { return ShouldTrackLaneMasks; }
 
 private:
   void topologicalSort();

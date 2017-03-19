@@ -25,6 +25,7 @@
 #include "llvm/CodeGen/MachineScheduler.h"
 #include "llvm/CodeGen/RegisterPressure.h"
 #include "llvm/CodeGen/SlotIndexes.h"
+#include "llvm/MC/LaneBitmask.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
@@ -137,6 +138,437 @@ using namespace llvm;
 // As we expect the driver to be able to preload the constants soon.
 
 // common code //
+
+SISchedulerRPTracker::SISchedulerRPTracker(
+    const SmallVectorImpl<RegisterMaskPair> &LiveIns,
+    const SmallVectorImpl<RegisterMaskPair> &LiveOuts,
+    const std::vector<SmallVector<unsigned, 8>> &ItemSuccs,
+    const std::vector<SmallVector<unsigned, 8>> &ItemPreds,
+    const std::vector<SmallVector<RegisterMaskPair, 8>> &InRegsForItem_,
+    const std::vector<SmallVector<RegisterMaskPair, 8>> &OutRegsForItem_,
+    const MachineRegisterInfo *MRI,
+    const TargetRegisterInfo *TRI,
+    unsigned VGPRSetID,
+    unsigned SGPRSetID
+  ):
+  MRI(MRI), TRI(TRI), VGPRSetID(VGPRSetID), SGPRSetID(SGPRSetID),
+  ItemSuccs(ItemSuccs), ItemPreds(ItemPreds), CurrentVGPRUsage(0),
+  CurrentSGPRUsage(0)
+{
+  unsigned DAGSize = ItemSuccs.size();
+
+  fillTopoData();
+
+  // To track register usage, we define for each register definition
+  // a number of usages before it gets released.
+  // This doesn't work with LaneMasks.
+  // To handle LaneMasks, we 'cut' registers affected by LaneMasks
+  // into all their different Lanes possible
+  // and behave as if that (reg, LaneMask) was a register.
+  std::map<unsigned, SmallVector<LaneBitmask, 8>> RegWithLaneMask;
+  auto addRegToRegWithLaneMask = [&](const RegisterMaskPair &P) {
+    if (!P.LaneMask.all() &&
+        P.LaneMask != MRI->getMaxLaneMaskForVReg(P.RegUnit))
+      RegWithLaneMask[P.RegUnit].push_back(P.LaneMask);
+  };
+
+  std::for_each(LiveIns.begin(), LiveIns.end(), addRegToRegWithLaneMask);
+  std::for_each(LiveOuts.begin(), LiveOuts.end(), addRegToRegWithLaneMask);
+  for (const auto &InRegs : InRegsForItem_)
+    std::for_each(InRegs.begin(), InRegs.end(), addRegToRegWithLaneMask);
+  for (const auto &OutRegs : OutRegsForItem_)
+    std::for_each(OutRegs.begin(), OutRegs.end(), addRegToRegWithLaneMask);
+
+  // Since we ignored when the lane mask was getMaxLaneMaskForVReg,
+  // we need to add it back. It doesn't hurt if there was no element
+  // with this mask for this register.
+  for (auto &RegLaneMasks : RegWithLaneMask) {
+    RegLaneMasks.second.push_back(MRI->getMaxLaneMaskForVReg(RegLaneMasks.first));
+  }
+
+  // Fills LaneMaskBasisForReg
+  for (const auto &RegLaneMasks : RegWithLaneMask) {
+    SmallVector<LaneBitmask, 8> &LaneBasis =
+      LaneMaskBasisForReg[RegLaneMasks.first];
+    for (const LaneBitmask &LaneMask : RegLaneMasks.second) {
+      LaneBitmask Remaining = LaneMask;
+      for (auto I = LaneBasis.begin(); I != LaneBasis.end(); ++I) {
+        LaneBitmask Elem = *I;
+        if ((Remaining & Elem).none())
+          continue;
+        if ((Remaining & Elem) == Elem) {
+          Remaining &= ~Elem;
+          continue;
+        }
+        // Remaining intersects with Elem, but Elem is not
+        // included in remaining. We divide Elem into two elements.
+        // The one included in Remaining, and the rest.
+        LaneBitmask NewElem = Elem & ~Remaining;
+        *I = Elem & Remaining;
+        LaneBasis.push_back(NewElem);
+      }
+      if (Remaining.any())
+        LaneBasis.push_back(Remaining);
+    }
+  }
+
+  auto convertRegs = [=](const SmallVectorImpl<RegisterMaskPair> &Regs) {
+    return getPairsForRegs(Regs);
+  };
+
+  InRegsForItem.resize(DAGSize);
+  OutRegsForItem.resize(DAGSize);
+  std::transform(InRegsForItem_.begin(), InRegsForItem_.end(),
+                 InRegsForItem.begin(), convertRegs);
+  std::transform(OutRegsForItem_.begin(), OutRegsForItem_.end(),
+                 OutRegsForItem.begin(), convertRegs);
+
+  // Add InRegs to LiveRegs after we add missing LiveIns
+  SmallVector<RegisterMaskPair, 8> InRegs = getPairsForRegs(LiveIns);
+
+  // Fill the usage of every output
+  // Warning: while by construction we always have a link between two items
+  // when one needs a result from the other, the number of users of an output
+  // is not the sum of child items having as input the same virtual register.
+  // Here is an example. A produces x and y. B eats x and produces x'.
+  // C eats x' and y. The register coalescer may have attributed the same
+  // virtual register to x and x'.
+  // To count accurately, we do a topological sort. In case the register is
+  // found for several parents, we increment the usage of the one with the
+  // highest topological index.
+  OutRegsNumUsages.resize(DAGSize);
+  for (unsigned i = 0; i < DAGSize; i++) {
+    for (const auto &RegPair : InRegsForItem[i]) {
+      bool Found = false;
+      int topoInd = -1;
+      for (unsigned PredID : ItemPreds[i]) {
+        const auto &PredOutRegs =
+          this->OutRegsForItem[PredID];
+        for (const auto &RegPair2 : PredOutRegs) {
+          if (RegPair == RegPair2) {
+            Found = true;
+            if (topoInd < (int)TopoItemToIndex[PredID]) {
+              topoInd = TopoItemToIndex[PredID];
+            }
+            break;
+          }
+        }
+      }
+
+      if (!Found) {
+        // Fill RemainingRegsConsumers for regs that were already
+        // defined before scheduling.
+        ++RemainingRegsConsumers[RegPair];
+        // Workaround for incomplete liveIns: Add missing liveIns.
+        // addLiveRegs is noop if already Live.
+        InRegs.push_back(RegPair);
+      }
+      else {
+        unsigned PredID = TopoIndexToItem[topoInd];
+        ++OutRegsNumUsages[PredID][RegPair];
+      }
+    }
+  }
+
+  addLiveRegs(InRegs);
+
+  ItemNumPredsLeft.resize(DAGSize);
+
+  for (unsigned i = 0; i < DAGSize; i++) {
+    unsigned NumPreds = ItemPreds[i].size();
+    ItemNumPredsLeft[i] = NumPreds;
+    if (NumPreds == 0)
+      ReadyItems.push_back(i);
+  }
+
+  // Increase OutRegsNumUsages for items
+  // producing registers consumed in another
+  // scheduling region.
+  for (const RegisterMaskPair &RegPair : getPairsForRegs(LiveOuts)) {
+    for (unsigned i = 0; i < DAGSize; i++) {
+      // Do reverse traversal
+      bool Found = false;
+      int ID = TopoIndexToItem[DAGSize-1-i];
+      const auto &OutRegs =
+        this->OutRegsForItem[ID];
+
+      for (const auto &RegPair2 : OutRegs) {
+        if (RegPair == RegPair2) {
+          Found = true;
+          break;
+        }
+      }
+
+      if (!Found)
+        continue;
+
+      ++OutRegsNumUsages[ID][RegPair];
+      break;
+    }
+  }
+}
+
+void
+SISchedulerRPTracker::getCurrentRegUsage(unsigned &VGPR, unsigned &SGPR)
+{
+  VGPR = CurrentVGPRUsage;
+  SGPR = CurrentSGPRUsage;
+}
+
+void
+SISchedulerRPTracker::checkRegUsageImpact(unsigned ID,
+                                          int &DiffVGPR,
+                                          int &DiffSGPR) {
+  SmallDenseMap<unsigned, LaneBitmask> Map;
+  SmallDenseSet<unsigned> Set;
+
+  DiffVGPR = 0;
+  DiffSGPR = 0;
+
+  for (const auto &RegPair : InRegsForItem[ID]) {
+    // For now only track virtual registers.
+    unsigned Reg = RegPair.RegUnit;
+    if (TargetRegisterInfo::isVirtualRegister(Reg))
+      continue;
+
+    if (RemainingRegsConsumers[RegPair] > 1)
+      continue;
+    Map[Reg] |= RegPair.LaneMask;
+  }
+
+  for (const auto &RegPair : Map) {
+    if (LiveRegs[RegPair.first] == RegPair.second) {
+      PSetIterator PSetI = MRI->getPressureSets(RegPair.first);
+      for (; PSetI.isValid(); ++PSetI) {
+        if (*PSetI == VGPRSetID)
+          DiffVGPR -= PSetI.getWeight();
+        if (*PSetI == SGPRSetID)
+          DiffSGPR -= PSetI.getWeight();
+      }
+    }
+  }
+
+  for (const auto &RegPair : OutRegsForItem[ID]) {
+    // For now only track virtual registers.
+    unsigned Reg = RegPair.RegUnit;
+    if (TargetRegisterInfo::isVirtualRegister(Reg))
+      continue;
+
+    Set.insert(Reg);
+  }
+
+  for (unsigned Reg : Set) {
+    // Check register is not already alive (at least some lanes)
+    if (LiveRegs.find(Reg) == LiveRegs.end()) {
+      PSetIterator PSetI = MRI->getPressureSets(Reg);
+      for (; PSetI.isValid(); ++PSetI) {
+        if (*PSetI == VGPRSetID)
+          DiffVGPR += PSetI.getWeight();
+        if (*PSetI == SGPRSetID)
+          DiffSGPR += PSetI.getWeight();
+      }
+    }
+  }
+}
+
+#ifndef NDEBUG
+
+void
+SISchedulerRPTracker::printDebugLives()
+{
+  for (const auto &RegPair : LiveRegs) {
+    dbgs() << PrintVRegOrUnit(RegPair.first, TRI);
+    if (!RegPair.second.all())
+      dbgs() << ':' << PrintLaneMask(RegPair.second);
+   dbgs() << ' ';
+  }
+}
+
+#endif
+
+SmallVector<RegisterMaskPair, 8>
+SISchedulerRPTracker::getPairsForReg(unsigned Reg, LaneBitmask Mask)
+{
+  SmallVector<RegisterMaskPair, 8> Result;
+
+  getPairsForReg(Result, Reg, Mask);
+
+  return Result;
+}
+
+void
+SISchedulerRPTracker::getPairsForReg(SmallVector<RegisterMaskPair, 8> &ToAppend,
+                                     unsigned Reg, LaneBitmask Mask)
+{
+  auto Basis = LaneMaskBasisForReg.find(Reg);
+  if (Basis == LaneMaskBasisForReg.end()) {
+    assert(Mask.all() || Mask == MRI->getMaxLaneMaskForVReg(Reg));
+    // We want unicity of the RegisterMaskPair for a same register/mask
+    // Thus replace getMaxLaneMaskForVReg by all, since they have the same
+    // meaning.
+    // Note: Physical registers have Mask.all(), but are disallowed
+    // to call getMaxLaneMaskForVReg.
+    if (!Mask.all() && Mask == MRI->getMaxLaneMaskForVReg(Reg))
+      Mask = LaneBitmask::getAll();
+    ToAppend.push_back(RegisterMaskPair(Reg, Mask));
+  } else {
+    for (const auto &Elem : Basis->second) {
+      if ((Mask & Elem).any()) {
+        assert((Mask & Elem) == Elem);
+        ToAppend.push_back(RegisterMaskPair(Reg, Elem));
+        Mask &= ~Elem;
+      }
+    }
+    // Mask.all will have a non-none value.
+    // We want Mask.all equivalent to the max lane mask.
+    assert((Mask & MRI->getMaxLaneMaskForVReg(Reg)).none());
+  }
+}
+
+SmallVector<RegisterMaskPair, 8>
+SISchedulerRPTracker::getPairsForRegs(const SmallVectorImpl<RegisterMaskPair> &Regs)
+{
+  SmallVector<RegisterMaskPair, 8> Result;
+
+  std::for_each(Regs.begin(), Regs.end(),
+                [&](const RegisterMaskPair &RegPair){
+                  getPairsForReg(Result, RegPair.RegUnit,
+                                 RegPair.LaneMask);
+                });
+
+  return Result;
+}
+
+void
+SISchedulerRPTracker::fillTopoData()
+{
+  unsigned DAGSize = ItemSuccs.size();
+  std::vector<int> WorkList;
+
+  DEBUG(dbgs() << "Topological Sort\n");
+
+  WorkList.reserve(DAGSize);
+  TopoIndexToItem.resize(DAGSize);
+  TopoItemToIndex.resize(DAGSize);
+
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    unsigned Degree = ItemSuccs[i].size();
+    TopoItemToIndex[i] = Degree;
+    if (Degree == 0) {
+      WorkList.push_back(i);
+    }
+  }
+
+  int Id = DAGSize;
+  while (!WorkList.empty()) {
+    int i = WorkList.back();
+    WorkList.pop_back();
+    TopoItemToIndex[i] = --Id;
+    TopoIndexToItem[Id] = i;
+    for (unsigned PredID : ItemPreds[i]) {
+      if (!--TopoItemToIndex[PredID])
+        WorkList.push_back(PredID);
+    }
+  }
+
+#ifndef NDEBUG
+  // Check correctness of the ordering.
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    for (unsigned PredID : ItemPreds[i]) {
+      assert(TopoItemToIndex[i] > TopoItemToIndex[PredID] &&
+      "Wrong Top Down topological sorting");
+    }
+  }
+#endif
+}
+
+void
+SISchedulerRPTracker::addLiveRegs(const SmallVectorImpl<RegisterMaskPair> &Regs) {
+  for (const RegisterMaskPair &RegPair : Regs) {
+    unsigned Reg = RegPair.RegUnit;
+    // For now only track virtual registers.
+    if (!TargetRegisterInfo::isVirtualRegister(Reg))
+      continue;
+
+    auto Pos = LiveRegs.find(Reg);
+
+    if (Pos == LiveRegs.end()) {
+      assert(RegPair.LaneMask.any());
+      LiveRegs.insert(std::make_pair(Reg, RegPair.LaneMask));
+      PSetIterator PSetI = MRI->getPressureSets(Reg);
+      for (; PSetI.isValid(); ++PSetI) {
+        if (*PSetI == VGPRSetID)
+          CurrentVGPRUsage += PSetI.getWeight();
+        if (*PSetI == SGPRSetID)
+          CurrentSGPRUsage += PSetI.getWeight();
+      }
+    }
+    else {
+      Pos->second |= RegPair.LaneMask;
+    }
+  }
+}
+
+void
+SISchedulerRPTracker::decreaseLiveRegs(const SmallVectorImpl<RegisterMaskPair> &Regs) {
+  for (const RegisterMaskPair &RegPair : Regs) {
+    // For now only track virtual registers.
+    unsigned Reg = RegPair.RegUnit;
+    if (!TargetRegisterInfo::isVirtualRegister(Reg))
+      continue;
+
+    std::map<unsigned, LaneBitmask>::iterator Pos = LiveRegs.find(Reg);
+    assert(Pos != LiveRegs.end() && // Reg must be live.
+           RemainingRegsConsumers.find(RegPair) !=
+             RemainingRegsConsumers.end() &&
+           RemainingRegsConsumers[RegPair] >= 1);
+    --RemainingRegsConsumers[RegPair];
+    if (RemainingRegsConsumers[RegPair] == 0) {
+      if (Pos->second == RegPair.LaneMask) {
+        LiveRegs.erase(Pos);
+        PSetIterator PSetI = MRI->getPressureSets(Reg);
+        for (; PSetI.isValid(); ++PSetI) {
+          if (*PSetI == VGPRSetID)
+            CurrentVGPRUsage -= PSetI.getWeight();
+          if (*PSetI == SGPRSetID)
+            CurrentSGPRUsage -= PSetI.getWeight();
+        }
+      }
+      else
+        Pos->second &= ~RegPair.LaneMask;
+    }
+  }
+}
+
+void
+SISchedulerRPTracker::releaseItemSuccs(unsigned ID) {
+  for (unsigned SuccID : ItemSuccs[ID]) {
+    if (--ItemNumPredsLeft[SuccID] == 0)
+      ReadyItems.push_back(SuccID);
+  }
+}
+
+void
+SISchedulerRPTracker::itemScheduled(unsigned ID) {
+  auto ReadyItemPos = std::find(ReadyItems.begin(), ReadyItems.end(), ID);
+  assert(ReadyItemPos != ReadyItems.end());
+  ReadyItems.erase(ReadyItemPos);
+  decreaseLiveRegs(InRegsForItem[ID]);
+  addLiveRegs(OutRegsForItem[ID]);
+  releaseItemSuccs(ID);
+  for (std::map<RegisterMaskPair, unsigned>::iterator RegI =
+       OutRegsNumUsages[ID].begin(),
+       E = OutRegsNumUsages[ID].end(); RegI != E; ++RegI) {
+    std::pair<RegisterMaskPair, unsigned> RegP = *RegI;
+    if (!TargetRegisterInfo::isVirtualRegister(RegP.first.RegUnit))
+      continue;
+    // We produce this register, thus it must not be previously alive.
+    assert(RemainingRegsConsumers.find(RegP.first) ==
+             RemainingRegsConsumers.end() ||
+           RemainingRegsConsumers[RegP.first] == 0);
+    RemainingRegsConsumers[RegP.first] += RegP.second;
+  }
+}
 
 #ifndef NDEBUG
 
@@ -254,17 +686,19 @@ void SIScheduleBlock::tryCandidateTopDown(SISchedCandidate &Cand,
 }
 
 SUnit* SIScheduleBlock::pickNode() {
+  SmallVector<unsigned, 16> TopReadySUs = RPTracker->getReadyItems();
   SISchedCandidate TopCand;
+  unsigned VGPRCurrentUsage, SGPRCurrentUsage;
+  RPTracker->getCurrentRegUsage(VGPRCurrentUsage, SGPRCurrentUsage);
 
-  for (SUnit* SU : TopReadySUs) {
+  for (unsigned ID : TopReadySUs) {
+    SUnit *SU = SUnits[ID];
     SISchedCandidate TryCand;
-    std::vector<unsigned> pressure;
-    std::vector<unsigned> MaxPressure;
-    // Predict register usage after this instruction.
+    int VGPRDiff, SGPRDiff;
     TryCand.SU = SU;
-    TopRPTracker.getDownwardPressure(SU->getInstr(), pressure, MaxPressure);
-    TryCand.SGPRUsage = pressure[DAG->getSGPRSetID()];
-    TryCand.VGPRUsage = pressure[DAG->getVGPRSetID()];
+    RPTracker->checkRegUsageImpact(ID, VGPRDiff, SGPRDiff);
+    TryCand.SGPRUsage = SGPRCurrentUsage + SGPRDiff;
+    TryCand.VGPRUsage = VGPRCurrentUsage + VGPRDiff;
     TryCand.IsLowLatency = DAG->IsLowLatencySU[SU->NodeNum];
     TryCand.LowLatencyOffset = DAG->LowLatencyOffset[SU->NodeNum];
     TryCand.HasLowLatencyNonWaitedParent =
@@ -277,230 +711,144 @@ SUnit* SIScheduleBlock::pickNode() {
   return TopCand.SU;
 }
 
-
-// Schedule something valid.
-void SIScheduleBlock::fastSchedule() {
-  TopReadySUs.clear();
-  if (Scheduled)
-    undoSchedule();
-
-  for (SUnit* SU : SUnits) {
-    if (!SU->NumPredsLeft)
-      TopReadySUs.push_back(SU);
+static void addRegLanes(SmallVectorImpl<RegisterMaskPair> &RegUnits,
+                        RegisterMaskPair Pair) {
+  unsigned RegUnit = Pair.RegUnit;
+  assert(Pair.LaneMask.any());
+  auto I = llvm::find_if(RegUnits, [RegUnit](const RegisterMaskPair Other) {
+    return Other.RegUnit == RegUnit;
+  });
+  if (I == RegUnits.end()) {
+    RegUnits.push_back(Pair);
+  } else {
+    I->LaneMask |= Pair.LaneMask;
   }
-
-  while (!TopReadySUs.empty()) {
-    SUnit *SU = TopReadySUs[0];
-    ScheduledSUnits.push_back(SU);
-    nodeScheduled(SU);
-  }
-
-  Scheduled = true;
 }
 
-// Returns if the register was set between first and last.
-static bool isDefBetween(unsigned Reg,
-                           SlotIndex First, SlotIndex Last,
-                           const MachineRegisterInfo *MRI,
-                           const LiveIntervals *LIS) {
-  for (MachineRegisterInfo::def_instr_iterator
-       UI = MRI->def_instr_begin(Reg),
-       UE = MRI->def_instr_end(); UI != UE; ++UI) {
-    const MachineInstr* MI = &*UI;
-    if (MI->isDebugValue())
-      continue;
-    SlotIndex InstSlot = LIS->getInstructionIndex(*MI).getRegSlot();
-    if (InstSlot >= First && InstSlot <= Last)
-      return true;
-  }
-  return false;
-}
-
-void SIScheduleBlock::initRegPressure(MachineBasicBlock::iterator BeginBlock,
-                                      MachineBasicBlock::iterator EndBlock) {
-  IntervalPressure Pressure, BotPressure;
-  RegPressureTracker RPTracker(Pressure), BotRPTracker(BotPressure);
-  LiveIntervals *LIS = DAG->getLIS();
-  MachineRegisterInfo *MRI = DAG->getMRI();
-  DAG->initRPTracker(TopRPTracker);
-  DAG->initRPTracker(BotRPTracker);
-  DAG->initRPTracker(RPTracker);
-
-  // Goes though all SU. RPTracker captures what had to be alive for the SUs
-  // to execute, and what is still alive at the end.
-  for (SUnit* SU : ScheduledSUnits) {
-    RPTracker.setPos(SU->getInstr());
-    RPTracker.advance();
-  }
-
-  // Close the RPTracker to finalize live ins/outs.
-  RPTracker.closeRegion();
-
-  // Initialize the live ins and live outs.
-  TopRPTracker.addLiveRegs(RPTracker.getPressure().LiveInRegs);
-  BotRPTracker.addLiveRegs(RPTracker.getPressure().LiveOutRegs);
-
-  // Do not Track Physical Registers, because it messes up.
-  for (const auto &RegMaskPair : RPTracker.getPressure().LiveInRegs) {
-    if (TargetRegisterInfo::isVirtualRegister(RegMaskPair.RegUnit))
-      LiveInRegs.insert(RegMaskPair.RegUnit);
-  }
-  LiveOutRegs.clear();
-  // There is several possibilities to distinguish:
-  // 1) Reg is not input to any instruction in the block, but is output of one
-  // 2) 1) + read in the block and not needed after it
-  // 3) 1) + read in the block but needed in another block
-  // 4) Reg is input of an instruction but another block will read it too
-  // 5) Reg is input of an instruction and then rewritten in the block.
-  //    result is not read in the block (implies used in another block)
-  // 6) Reg is input of an instruction and then rewritten in the block.
-  //    result is read in the block and not needed in another block
-  // 7) Reg is input of an instruction and then rewritten in the block.
-  //    result is read in the block but also needed in another block
-  // LiveInRegs will contains all the regs in situation 4, 5, 6, 7
-  // We want LiveOutRegs to contain only Regs whose content will be read after
-  // in another block, and whose content was written in the current block,
-  // that is we want it to get 1, 3, 5, 7
-  // Since we made the MIs of a block to be packed all together before
-  // scheduling, then the LiveIntervals were correct, and the RPTracker was
-  // able to correctly handle 5 vs 6, 2 vs 3.
-  // (Note: This is not sufficient for RPTracker to not do mistakes for case 4)
-  // The RPTracker's LiveOutRegs has 1, 3, (some correct or incorrect)4, 5, 7
-  // Comparing to LiveInRegs is not sufficient to differenciate 4 vs 5, 7
-  // The use of findDefBetween removes the case 4.
-  for (const auto &RegMaskPair : RPTracker.getPressure().LiveOutRegs) {
-    unsigned Reg = RegMaskPair.RegUnit;
-    if (TargetRegisterInfo::isVirtualRegister(Reg) &&
-        isDefBetween(Reg, LIS->getInstructionIndex(*BeginBlock).getRegSlot(),
-                     LIS->getInstructionIndex(*EndBlock).getRegSlot(), MRI,
-                     LIS)) {
-      LiveOutRegs.insert(Reg);
+static void getDefsForSU(SmallVector<RegisterMaskPair, 8> &Defs,
+                         const SUnit &SU, const TargetRegisterInfo *TRI,
+                         bool ShouldTrackLaneMasks)
+{
+  for (const MachineOperand &MO : SU.getInstr()->operands()) {
+    if (MO.isReg() && MO.isDef() && !MO.isDead()) {
+      unsigned Reg = MO.getReg();
+      // For now only track virtual registers
+      if (!TargetRegisterInfo::isVirtualRegister(Reg))
+        continue;
+      if (!ShouldTrackLaneMasks)
+        addRegLanes(Defs, RegisterMaskPair(Reg, LaneBitmask::getAll()));
+      else {
+        unsigned SubRegIdx = MO.getSubReg();
+        if (MO.isUndef())
+          SubRegIdx = 0;
+        addRegLanes(Defs, RegisterMaskPair(Reg,
+          SubRegIdx != 0 ?
+            TRI->getSubRegIndexLaneMask(SubRegIdx) :
+            LaneBitmask::getAll()));
+      }
     }
   }
-
-  // Pressure = sum_alive_registers register size
-  // Internally llvm will represent some registers as big 128 bits registers
-  // for example, but they actually correspond to 4 actual 32 bits registers.
-  // Thus Pressure is not equal to num_alive_registers * constant.
-  LiveInPressure = TopPressure.MaxSetPressure;
-  LiveOutPressure = BotPressure.MaxSetPressure;
-
-  // Prepares TopRPTracker for top down scheduling.
-  TopRPTracker.closeTop();
 }
 
-void SIScheduleBlock::schedule(MachineBasicBlock::iterator BeginBlock,
-                               MachineBasicBlock::iterator EndBlock) {
-  if (!Scheduled)
-    fastSchedule();
+// Here one big difference with RegOpers.collect is that
+// we don't count in the Uses the Defs with readsReg() when
+// ShouldTrackLaneMasks is false.
+// We don't choose not to count them because the undef flags
+// are not always set properly (we would need to schedule first
+// and update LiveIntervals to get them correct).
+// For better tracking, we prefer to miss some uses, rather than
+// having incorrect uses.
+static void getUsesForSU(SmallVector<RegisterMaskPair, 8> &Uses,
+                         const SUnit &SU, const TargetRegisterInfo *TRI,
+                         bool ShouldTrackLaneMasks)
+{
+  for (const MachineOperand &MO : SU.getInstr()->operands()) {
+    if (MO.isReg() && MO.isUse() && !MO.isUndef() && !MO.isInternalRead()) {
+      unsigned Reg = MO.getReg();
+      if (!TargetRegisterInfo::isVirtualRegister(Reg))
+        continue;
+      if (!ShouldTrackLaneMasks)
+        addRegLanes(Uses, RegisterMaskPair(Reg, LaneBitmask::getAll()));
+      else {
+        unsigned SubRegIdx = MO.getSubReg();
+        if (MO.isUndef())
+          SubRegIdx = 0;
+        addRegLanes(Uses, RegisterMaskPair(Reg,
+          SubRegIdx != 0 ?
+            TRI->getSubRegIndexLaneMask(SubRegIdx) :
+            LaneBitmask::getAll()));
+      }
+    }
+  }
+}
 
-  // PreScheduling phase to set LiveIn and LiveOut.
-  initRegPressure(BeginBlock, EndBlock);
-  undoSchedule();
+void SIScheduleBlock::schedule() {
+  std::vector<SmallVector<unsigned, 8>> SUSuccs;
+  std::vector<SmallVector<unsigned, 8>> SUPreds;
+  std::vector<SmallVector<RegisterMaskPair, 8>> InRegsForSU;
+  std::vector<SmallVector<RegisterMaskPair, 8>> OutRegsForSU;
 
-  // Schedule for real now.
+  SUSuccs.resize(SUnits.size());
+  SUPreds.resize(SUnits.size());
+  InRegsForSU.resize(SUnits.size());
+  OutRegsForSU.resize(SUnits.size());
 
-  TopReadySUs.clear();
+  for (unsigned i = 0; i < SUnits.size(); i++) {
+    SUnit *SU = SUnits[i];
 
-  for (SUnit* SU : SUnits) {
-    if (!SU->NumPredsLeft)
-      TopReadySUs.push_back(SU);
+    for (SDep& SuccDep : SU->Succs) {
+      SUnit *Succ = SuccDep.getSUnit();
+      if (Succ->isBoundaryNode() || !BC->isSUInBlock(Succ, ID))
+        continue;
+      if (SuccDep.isWeak())
+        continue;
+      SUSuccs[i].push_back(NodeNum2Index[Succ->NodeNum]);
+    }
+    for (SDep& PredDep : SU->Preds) {
+      SUnit *Pred = PredDep.getSUnit();
+      if (Pred->isBoundaryNode() || !BC->isSUInBlock(Pred, ID))
+        continue;
+      if (PredDep.isWeak())
+        continue;
+      SUPreds[i].push_back(NodeNum2Index[Pred->NodeNum]);
+    }
+    getUsesForSU(InRegsForSU[i], *SU, DAG->getTRI(),
+                 DAG->shouldTrackLaneMasks());
+    getDefsForSU(OutRegsForSU[i], *SU, DAG->getTRI(),
+                 DAG->shouldTrackLaneMasks());
   }
 
-  while (!TopReadySUs.empty()) {
+  RPTracker.reset(new SISchedulerRPTracker(
+    LiveInRegs,
+    LiveOutRegs,
+    SUSuccs,
+    SUPreds,
+    InRegsForSU,
+    OutRegsForSU,
+    DAG->getMRI(),
+    DAG->getTRI(),
+    DAG->getVGPRSetID(),
+    DAG->getSGPRSetID()
+  ));
+
+  while (!RPTracker->getReadyItems().empty()) {
     SUnit *SU = pickNode();
     ScheduledSUnits.push_back(SU);
-    TopRPTracker.setPos(SU->getInstr());
-    TopRPTracker.advance();
     nodeScheduled(SU);
   }
 
   // TODO: compute InternalAdditionnalPressure.
-  InternalAdditionnalPressure.resize(TopPressure.MaxSetPressure.size());
+  InternalAdditionnalPressure.resize(DAG->getTRI()->getNumRegPressureSets());
 
   // Check everything is right.
 #ifndef NDEBUG
   assert(SUnits.size() == ScheduledSUnits.size() &&
-            TopReadySUs.empty());
-  for (SUnit* SU : SUnits) {
-    assert(SU->isScheduled &&
-              SU->NumPredsLeft == 0);
-  }
+         RPTracker->getReadyItems().empty());
 #endif
-
-  Scheduled = true;
-}
-
-void SIScheduleBlock::undoSchedule() {
-  for (SUnit* SU : SUnits) {
-    SU->isScheduled = false;
-    for (SDep& Succ : SU->Succs) {
-      if (BC->isSUInBlock(Succ.getSUnit(), ID))
-        undoReleaseSucc(SU, &Succ);
-    }
-  }
-  HasLowLatencyNonWaitedParent.assign(SUnits.size(), 0);
-  ScheduledSUnits.clear();
-  Scheduled = false;
-}
-
-void SIScheduleBlock::undoReleaseSucc(SUnit *SU, SDep *SuccEdge) {
-  SUnit *SuccSU = SuccEdge->getSUnit();
-
-  if (SuccEdge->isWeak()) {
-    ++SuccSU->WeakPredsLeft;
-    return;
-  }
-  ++SuccSU->NumPredsLeft;
-}
-
-void SIScheduleBlock::releaseSucc(SUnit *SU, SDep *SuccEdge) {
-  SUnit *SuccSU = SuccEdge->getSUnit();
-
-  if (SuccEdge->isWeak()) {
-    --SuccSU->WeakPredsLeft;
-    return;
-  }
-#ifndef NDEBUG
-  if (SuccSU->NumPredsLeft == 0) {
-    dbgs() << "*** Scheduling failed! ***\n";
-    SuccSU->dump(DAG);
-    dbgs() << " has been released too many times!\n";
-    llvm_unreachable(nullptr);
-  }
-#endif
-
-  --SuccSU->NumPredsLeft;
-}
-
-/// Release Successors of the SU that are in the block or not.
-void SIScheduleBlock::releaseSuccessors(SUnit *SU, bool InOrOutBlock) {
-  for (SDep& Succ : SU->Succs) {
-    SUnit *SuccSU = Succ.getSUnit();
-
-    if (SuccSU->NodeNum >= DAG->SUnits.size())
-        continue;
-
-    if (BC->isSUInBlock(SuccSU, ID) != InOrOutBlock)
-      continue;
-
-    releaseSucc(SU, &Succ);
-    if (SuccSU->NumPredsLeft == 0 && InOrOutBlock)
-      TopReadySUs.push_back(SuccSU);
-  }
 }
 
 void SIScheduleBlock::nodeScheduled(SUnit *SU) {
-  // Is in TopReadySUs
-  assert (!SU->NumPredsLeft);
-  std::vector<SUnit *>::iterator I = llvm::find(TopReadySUs, SU);
-  if (I == TopReadySUs.end()) {
-    dbgs() << "Data Structure Bug in SI Scheduler\n";
-    llvm_unreachable(nullptr);
-  }
-  TopReadySUs.erase(I);
-
-  releaseSuccessors(SU, true);
+  RPTracker->itemScheduled(NodeNum2Index[SU->NodeNum]);
   // Scheduling this node will trigger a wait,
   // thus propagate to other instructions that they do not need to wait either.
   if (HasLowLatencyNonWaitedParent[NodeNum2Index[SU->NodeNum]])
@@ -514,17 +862,15 @@ void SIScheduleBlock::nodeScheduled(SUnit *SU) {
         HasLowLatencyNonWaitedParent[I->second] = 1;
     }
   }
-  SU->isScheduled = true;
 }
 
-void SIScheduleBlock::finalizeUnits() {
-  // We remove links from outside blocks to enable scheduling inside the block.
+void SIScheduleBlock::finalize() {
   for (SUnit* SU : SUnits) {
-    releaseSuccessors(SU, false);
     if (DAG->IsHighLatencySU[SU->NodeNum])
       HighLatencyBlock = true;
   }
   HasLowLatencyNonWaitedParent.resize(SUnits.size(), 0);
+  schedule();
 }
 
 // we maintain ascending order of IDs
@@ -568,6 +914,65 @@ void SIScheduleBlock::addSucc(SIScheduleBlock *Succ,
          "Loop in the Block Graph!");
 }
 
+void SIScheduleBlock::addLiveIns(SmallVector<RegisterMaskPair, 8> Ins)
+{
+  const MachineRegisterInfo *MRI = DAG->getMRI();
+  unsigned VGPRSetID = DAG->getVGPRSetID();
+  unsigned SGPRSetID = DAG->getSGPRSetID();
+
+  auto addLiveIn = [&](RegisterMaskPair &RegPair) {
+    unsigned Reg = RegPair.RegUnit;
+    assert(RegPair.LaneMask.any());
+    auto Pos = std::find_if(LiveInRegs.begin(), LiveInRegs.end(),
+                            [=](RegisterMaskPair &RegPair2) {
+                              return RegPair2.RegUnit == Reg;
+                            });
+    if (Pos == LiveInRegs.end()) {
+      LiveInRegs.push_back(RegPair);
+      PSetIterator PSetI = MRI->getPressureSets(Reg);
+      for (; PSetI.isValid(); ++PSetI) {
+        if (*PSetI == VGPRSetID)
+          LiveInVGPRPressure += PSetI.getWeight();
+        if (*PSetI == SGPRSetID)
+          LiveInSGPRPressure += PSetI.getWeight();
+      }
+    }
+    else
+      Pos->LaneMask |= RegPair.LaneMask;
+  };
+
+  std::for_each(Ins.begin(), Ins.end(), addLiveIn);
+}
+
+void SIScheduleBlock::addLiveOuts(SmallVector<RegisterMaskPair, 8> Outs)
+{
+  const MachineRegisterInfo *MRI = DAG->getMRI();
+  unsigned VGPRSetID = DAG->getVGPRSetID();
+  unsigned SGPRSetID = DAG->getSGPRSetID();
+
+  auto addLiveOut = [&](RegisterMaskPair &RegPair) {
+    unsigned Reg = RegPair.RegUnit;
+    auto Pos = std::find_if(LiveOutRegs.begin(), LiveOutRegs.end(),
+                            [=](RegisterMaskPair &RegPair2) {
+                              return RegPair2.RegUnit == Reg;
+                            });
+    if (Pos == LiveOutRegs.end()) {
+      LiveOutRegs.push_back(RegPair);
+      PSetIterator PSetI = MRI->getPressureSets(Reg);
+      for (; PSetI.isValid(); ++PSetI) {
+        if (*PSetI == VGPRSetID)
+          LiveOutVGPRPressure += PSetI.getWeight();
+        if (*PSetI == SGPRSetID)
+          LiveOutSGPRPressure += PSetI.getWeight();
+      }
+    }
+    else
+      Pos->LaneMask |= RegPair.LaneMask;
+  };
+
+  std::for_each(Outs.begin(), Outs.end(), addLiveOut);
+}
+
 #ifndef NDEBUG
 void SIScheduleBlock::printDebug(bool full) {
   dbgs() << "Block (" << ID << ")\n";
@@ -588,29 +993,29 @@ void SIScheduleBlock::printDebug(bool full) {
     S.first->printDebug(false);
   }
 
-  if (Scheduled) {
-    dbgs() << "LiveInPressure " << LiveInPressure[DAG->getSGPRSetID()] << ' '
-           << LiveInPressure[DAG->getVGPRSetID()] << '\n';
-    dbgs() << "LiveOutPressure " << LiveOutPressure[DAG->getSGPRSetID()] << ' '
-           << LiveOutPressure[DAG->getVGPRSetID()] << "\n\n";
-    dbgs() << "LiveIns:\n";
-    for (unsigned Reg : LiveInRegs)
-      dbgs() << PrintVRegOrUnit(Reg, DAG->getTRI()) << ' ';
+  dbgs() << "LiveInPressure " << LiveInVGPRPressure << ' '
+         << LiveInSGPRPressure << '\n';
+  dbgs() << "LiveOutPressure " << LiveOutVGPRPressure << ' '
+         << LiveOutSGPRPressure << "\n\n";
+  dbgs() << "LiveIns:\n";
+  for (const auto &Ins : LiveInRegs) {
+    dbgs() << PrintVRegOrUnit(Ins.RegUnit, DAG->getTRI());
+    if (!Ins.LaneMask.all())
+      dbgs() << ':' << PrintLaneMask(Ins.LaneMask);
+    dbgs() << ' ';
+  }
 
-    dbgs() << "\nLiveOuts:\n";
-    for (unsigned Reg : LiveOutRegs)
-      dbgs() << PrintVRegOrUnit(Reg, DAG->getTRI()) << ' ';
+  dbgs() << "\nLiveOuts:\n";
+  for (const auto &Outs : LiveOutRegs) {
+    dbgs() << PrintVRegOrUnit(Outs.RegUnit, DAG->getTRI());
+    if (!Outs.LaneMask.all())
+      dbgs() << ':' << PrintLaneMask(Outs.LaneMask);
+    dbgs() << ' ';
   }
 
   dbgs() << "\nInstructions:\n";
-  if (!Scheduled) {
-    for (SUnit* SU : SUnits) {
-      SU->dump(DAG);
-    }
-  } else {
-    for (SUnit* SU : SUnits) {
-      SU->dump(DAG);
-    }
+  for (SUnit* SU : SUnits) {
+    SU->dump(DAG);
   }
 
   dbgs() << "///////////////////////\n";
@@ -633,7 +1038,6 @@ SIScheduleBlockCreator::getBlocks(SISchedulerBlockCreatorVariant BlockVariant) {
     SIScheduleBlocks Res;
     createBlocksForVariant(BlockVariant);
     topologicalSort();
-    scheduleInsideBlocks();
     fillStats();
     Res.Blocks = CurrentBlocks;
     Res.TopDownIndex2Block = TopDownIndex2Block;
@@ -720,11 +1124,11 @@ void SIScheduleBlockCreator::colorHighLatenciesGroups() {
         // DAG->SUnits[j] are linked, DAG->SUnits[j] is neccessary
         // in the parent graph of SU.
 #ifndef NDEBUG
-        SubGraph = DAG->GetTopo()->GetSubGraph(SU, DAG->SUnits[j],
+        SubGraph = DAG->getTopo()->GetSubGraph(SU, DAG->SUnits[j],
                                                HasSubGraph);
         assert(!HasSubGraph);
 #endif
-        SubGraph = DAG->GetTopo()->GetSubGraph(DAG->SUnits[j], SU,
+        SubGraph = DAG->getTopo()->GetSubGraph(DAG->SUnits[j], SU,
                                                HasSubGraph);
         if (!HasSubGraph)
           continue; // No dependencies between each other
@@ -1139,9 +1543,6 @@ void SIScheduleBlockCreator::createBlocksForVariant(SISchedulerBlockCreatorVaria
   CurrentColoring.resize(DAGSize, 0);
   Node2CurrentBlock.clear();
 
-  // Restore links previous scheduling variant has overridden.
-  DAG->restoreSULinksLeft();
-
   NextReservedID = 1;
   NextNonReservedID = DAGSize + 1;
 
@@ -1196,10 +1597,53 @@ void SIScheduleBlockCreator::createBlocksForVariant(SISchedulerBlockCreatorVaria
     }
   }
 
-  // Free root and leafs of all blocks to enable scheduling inside them.
+  // Compute Block LiveIns
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &DAG->SUnits[i];
+    int SUID = Node2CurrentBlock[i];
+    SmallVector<RegisterMaskPair, 8> Uses;
+
+    getUsesForSU(Uses, *SU, DAG->getTRI(),
+                 DAG->shouldTrackLaneMasks());
+
+    // Remove From Uses everything that is defined by SUs of the same Block.
+    for (SDep& PredDep : SU->Preds) {
+      SUnit *Pred = PredDep.getSUnit();
+      if (Pred->isBoundaryNode() || Node2CurrentBlock[Pred->NodeNum] != SUID)
+        continue;
+      if (!PredDep.isAssignedRegDep())
+        continue;
+      if (!TargetRegisterInfo::isVirtualRegister(PredDep.getReg()))
+        continue;
+      removeUseFromDef(Uses, PredDep.getReg(), Pred);
+    }
+    // The remaining Uses are Block LiveIns.
+    CurrentBlocks[SUID]->addLiveIns(Uses);
+  }
+
+  // Compute Block LiveOut
+  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
+    SUnit *SU = &DAG->SUnits[i];
+    int SUID = Node2CurrentBlock[i];
+    SmallVector<RegisterMaskPair, 8> LiveOuts;
+
+    for (SDep& SuccDep : SU->Succs) {
+      SUnit *Succ = SuccDep.getSUnit();
+      if (!Succ->isBoundaryNode() && Node2CurrentBlock[Succ->NodeNum] == SUID)
+        continue;
+      if (!SuccDep.isAssignedRegDep())
+        continue;
+      // We don't track physical registers
+      if (!TargetRegisterInfo::isVirtualRegister(SuccDep.getReg()))
+        continue;
+      addDefFromUse(LiveOuts, SuccDep.getReg(), SU, Succ);
+    }
+    CurrentBlocks[SUID]->addLiveOuts(LiveOuts);
+  }
+
   for (unsigned i = 0, e = CurrentBlocks.size(); i != e; ++i) {
     SIScheduleBlock *Block = CurrentBlocks[i];
-    Block->finalizeUnits();
+    Block->finalize();
   }
   DEBUG(
     dbgs() << "Blocks created:\n\n";
@@ -1210,18 +1654,7 @@ void SIScheduleBlockCreator::createBlocksForVariant(SISchedulerBlockCreatorVaria
   );
 }
 
-// Two functions taken from Codegen/MachineScheduler.cpp
-
-/// Non-const version.
-static MachineBasicBlock::iterator
-nextIfDebug(MachineBasicBlock::iterator I,
-            MachineBasicBlock::const_iterator End) {
-  for (; I != End; ++I) {
-    if (!I->isDebugValue())
-      break;
-  }
-  return I;
-}
+// Adapted from Codegen/MachineScheduler.cpp
 
 void SIScheduleBlockCreator::topologicalSort() {
   unsigned DAGSize = CurrentBlocks.size();
@@ -1271,89 +1704,6 @@ void SIScheduleBlockCreator::topologicalSort() {
                                          TopDownIndex2Block.rend());
 }
 
-void SIScheduleBlockCreator::scheduleInsideBlocks() {
-  unsigned DAGSize = CurrentBlocks.size();
-
-  DEBUG(dbgs() << "\nScheduling Blocks\n\n");
-
-  // We do schedule a valid scheduling such that a Block corresponds
-  // to a range of instructions.
-  DEBUG(dbgs() << "First phase: Fast scheduling for Reg Liveness\n");
-  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
-    SIScheduleBlock *Block = CurrentBlocks[i];
-    Block->fastSchedule();
-  }
-
-  // Note: the following code, and the part restoring previous position
-  // is by far the most expensive operation of the Scheduler.
-
-  // Do not update CurrentTop.
-  MachineBasicBlock::iterator CurrentTopFastSched = DAG->getCurrentTop();
-  std::vector<MachineBasicBlock::iterator> PosOld;
-  std::vector<MachineBasicBlock::iterator> PosNew;
-  PosOld.reserve(DAG->SUnits.size());
-  PosNew.reserve(DAG->SUnits.size());
-
-  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
-    int BlockIndice = TopDownIndex2Block[i];
-    SIScheduleBlock *Block = CurrentBlocks[BlockIndice];
-    std::vector<SUnit*> SUs = Block->getScheduledUnits();
-
-    for (SUnit* SU : SUs) {
-      MachineInstr *MI = SU->getInstr();
-      MachineBasicBlock::iterator Pos = MI;
-      PosOld.push_back(Pos);
-      if (&*CurrentTopFastSched == MI) {
-        PosNew.push_back(Pos);
-        CurrentTopFastSched = nextIfDebug(++CurrentTopFastSched,
-                                          DAG->getCurrentBottom());
-      } else {
-        // Update the instruction stream.
-        DAG->getBB()->splice(CurrentTopFastSched, DAG->getBB(), MI);
-
-        // Update LiveIntervals.
-        // Note: Moving all instructions and calling handleMove every time
-        // is the most cpu intensive operation of the scheduler.
-        // It would gain a lot if there was a way to recompute the
-        // LiveIntervals for the entire scheduling region.
-        DAG->getLIS()->handleMove(*MI, /*UpdateFlags=*/true);
-        PosNew.push_back(CurrentTopFastSched);
-      }
-    }
-  }
-
-  // Now we have Block of SUs == Block of MI.
-  // We do the final schedule for the instructions inside the block.
-  // The property that all the SUs of the Block are grouped together as MI
-  // is used for correct reg usage tracking.
-  for (unsigned i = 0, e = DAGSize; i != e; ++i) {
-    SIScheduleBlock *Block = CurrentBlocks[i];
-    std::vector<SUnit*> SUs = Block->getScheduledUnits();
-    Block->schedule((*SUs.begin())->getInstr(), (*SUs.rbegin())->getInstr());
-  }
-
-  DEBUG(dbgs() << "Restoring MI Pos\n");
-  // Restore old ordering (which prevents a LIS->handleMove bug).
-  for (unsigned i = PosOld.size(), e = 0; i != e; --i) {
-    MachineBasicBlock::iterator POld = PosOld[i-1];
-    MachineBasicBlock::iterator PNew = PosNew[i-1];
-    if (PNew != POld) {
-      // Update the instruction stream.
-      DAG->getBB()->splice(POld, DAG->getBB(), PNew);
-
-      // Update LiveIntervals.
-      DAG->getLIS()->handleMove(*POld, /*UpdateFlags=*/true);
-    }
-  }
-
-  DEBUG(
-    for (unsigned i = 0, e = CurrentBlocks.size(); i != e; ++i) {
-      SIScheduleBlock *Block = CurrentBlocks[i];
-      Block->printDebug(true);
-    }
-  );
-}
-
 void SIScheduleBlockCreator::fillStats() {
   unsigned DAGSize = CurrentBlocks.size();
 
@@ -1386,60 +1736,142 @@ void SIScheduleBlockCreator::fillStats() {
   }
 }
 
+LaneBitmask SIScheduleBlockCreator::getLaneBitmaskForDef(const SUnit *SU,
+                                                         unsigned Reg)
+{
+  LaneBitmask DefMask = LaneBitmask::getNone();
+
+  for (const MachineOperand &MO : SU->getInstr()->operands()) {
+    if (MO.isReg() && MO.isDef() && MO.getReg() == Reg && !MO.isDead()) {
+      unsigned SubRegIdx = MO.getSubReg();
+      DefMask |= SubRegIdx != 0 ?
+        DAG->getTRI()->getSubRegIndexLaneMask(SubRegIdx) :
+        LaneBitmask::getAll();
+    }
+  }
+
+  return DefMask;
+}
+
+LaneBitmask SIScheduleBlockCreator::getLaneBitmaskForUse(const SUnit *SU,
+                                                         unsigned Reg)
+{
+  LaneBitmask UseMask = LaneBitmask::getNone();
+
+  for (const MachineOperand &MO : SU->getInstr()->operands()) {
+    if (MO.isReg() && MO.isUse() && MO.getReg() == Reg &&
+        !MO.isUndef() && !MO.isInternalRead()) {
+      unsigned SubRegIdx = MO.getSubReg();
+      UseMask |= SubRegIdx != 0 ?
+        DAG->getTRI()->getSubRegIndexLaneMask(SubRegIdx) :
+        LaneBitmask::getAll();
+    }
+  }
+
+  return UseMask;
+}
+
+static void replaceAllByMask(LaneBitmask &L, LaneBitmask &Mask)
+{
+  if (L.all())
+    L = Mask;
+}
+
+void
+SIScheduleBlockCreator::removeUseFromDef(SmallVectorImpl<RegisterMaskPair> &Uses,
+                                         unsigned Reg, const SUnit *SU)
+{
+  assert(TargetRegisterInfo::isVirtualRegister(Reg));
+  LaneBitmask LanesMaskMax, DefMask, UseMask;
+
+  auto UsePos = std::find_if(Uses.begin(), Uses.end(),
+                             [=](RegisterMaskPair P) {
+                               return P.RegUnit == Reg;
+                             });
+
+  // Already removed
+  if (UsePos == Uses.end())
+    return;
+
+  if (!DAG->shouldTrackLaneMasks()) {
+    Uses.erase(UsePos);
+    return;
+  }
+
+  LanesMaskMax = DAG->getMRI()->getMaxLaneMaskForVReg(Reg);
+  DefMask = getLaneBitmaskForDef(SU, Reg);
+  UseMask = UsePos->LaneMask;
+
+  replaceAllByMask(DefMask, LanesMaskMax);
+  replaceAllByMask(UseMask, LanesMaskMax);
+
+  if ((UseMask & ~DefMask).none())
+    Uses.erase(UsePos);
+  else
+    UsePos->LaneMask = UseMask & ~DefMask;
+}
+
+void
+SIScheduleBlockCreator::addDefFromUse(SmallVectorImpl<RegisterMaskPair> &Defs,
+                                      unsigned Reg, const SUnit *SUDef,
+                                      const SUnit *SUUse)
+{
+  LaneBitmask LanesMaskMax, DefMask, UseMask;
+  int DefIndex = DAG->getTopo()->getSUTopoIndex(*SUDef);
+
+  auto DefPos = std::find_if(Defs.begin(), Defs.end(),
+                             [=](RegisterMaskPair P) {
+                               return P.RegUnit == Reg;
+                             });
+
+  if (!DAG->shouldTrackLaneMasks()) {
+    if (DefPos == Defs.end())
+      Defs.push_back(RegisterMaskPair(Reg, LaneBitmask::getAll()));
+    return;
+  }
+
+  LanesMaskMax = DAG->getMRI()->getMaxLaneMaskForVReg(Reg);
+  DefMask = getLaneBitmaskForDef(SUDef, Reg);
+  UseMask = getLaneBitmaskForUse(SUUse, Reg);
+
+  replaceAllByMask(DefMask, LanesMaskMax);
+  replaceAllByMask(UseMask, LanesMaskMax);
+
+  for (const SDep& PredDep : SUUse->Preds) {
+    const SUnit *Pred = PredDep.getSUnit();
+    if (!PredDep.isAssignedRegDep())
+      continue;
+    if (PredDep.getReg() != Reg)
+      continue;
+    // Look for SUs that are after SUDef in the
+    // topological sort.
+    if (DAG->getTopo()->getSUTopoIndex(*Pred) <= DefIndex)
+      continue;
+    // These lanes content are defined by Pred,
+    // and thus not from SUDef.
+    UseMask &= ~getLaneBitmaskForDef(Pred, Reg);
+  }
+
+  DefMask &= UseMask;
+  // There is data dependency, thus DefMask cannot be none.
+  assert(!DefMask.none());
+
+  if (DefPos == Defs.end())
+    Defs.push_back(RegisterMaskPair(Reg, DefMask));
+  else
+    DefPos->LaneMask |= DefMask;
+}
+
 // SIScheduleBlockScheduler //
 
 SIScheduleBlockScheduler::SIScheduleBlockScheduler(SIScheduleDAGMI *DAG,
                                                    SISchedulerBlockSchedulerVariant Variant,
                                                    SIScheduleBlocks  BlocksStruct) :
   DAG(DAG), Variant(Variant), Blocks(BlocksStruct.Blocks),
-  LastPosWaitedHighLatency(0), NumBlockScheduled(0), VregCurrentUsage(0),
-  SregCurrentUsage(0), maxVregUsage(0), maxSregUsage(0) {
-
-  // Fill the usage of every output
-  // Warning: while by construction we always have a link between two blocks
-  // when one needs a result from the other, the number of users of an output
-  // is not the sum of child blocks having as input the same virtual register.
-  // Here is an example. A produces x and y. B eats x and produces x'.
-  // C eats x' and y. The register coalescer may have attributed the same
-  // virtual register to x and x'.
-  // To count accurately, we do a topological sort. In case the register is
-  // found for several parents, we increment the usage of the one with the
-  // highest topological index.
-  LiveOutRegsNumUsages.resize(Blocks.size());
-  for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
-    SIScheduleBlock *Block = Blocks[i];
-    for (unsigned Reg : Block->getInRegs()) {
-      bool Found = false;
-      int topoInd = -1;
-      for (SIScheduleBlock* Pred: Block->getPreds()) {
-        std::set<unsigned> PredOutRegs = Pred->getOutRegs();
-        std::set<unsigned>::iterator RegPos = PredOutRegs.find(Reg);
-
-        if (RegPos != PredOutRegs.end()) {
-          Found = true;
-          if (topoInd < BlocksStruct.TopDownBlock2Index[Pred->getID()]) {
-            topoInd = BlocksStruct.TopDownBlock2Index[Pred->getID()];
-          }
-        }
-      }
-
-      if (!Found)
-        continue;
-
-      int PredID = BlocksStruct.TopDownIndex2Block[topoInd];
-      ++LiveOutRegsNumUsages[PredID][Reg];
-    }
-  }
+  LastPosWaitedHighLatency(0), NumBlockScheduled(0),
+  maxVregUsage(0), maxSregUsage(0) {
 
   LastPosHighLatencyParentScheduled.resize(Blocks.size(), 0);
-  BlockNumPredsLeft.resize(Blocks.size());
-  BlockNumSuccsLeft.resize(Blocks.size());
-
-  for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
-    SIScheduleBlock *Block = Blocks[i];
-    BlockNumPredsLeft[i] = Block->getPreds().size();
-    BlockNumSuccsLeft[i] = Block->getSuccs().size();
-  }
 
 #ifndef NDEBUG
   for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
@@ -1448,54 +1880,38 @@ SIScheduleBlockScheduler::SIScheduleBlockScheduler(SIScheduleDAGMI *DAG,
   }
 #endif
 
-  std::set<unsigned> InRegs = DAG->getInRegs();
-  addLiveRegs(InRegs);
+  std::vector<SmallVector<unsigned, 8>> BlockSuccs;
+  std::vector<SmallVector<unsigned, 8>> BlockPreds;
+  std::vector<SmallVector<RegisterMaskPair, 8>> InRegsForBlock;
+  std::vector<SmallVector<RegisterMaskPair, 8>> OutRegsForBlock;
 
-  // Increase LiveOutRegsNumUsages for blocks
-  // producing registers consumed in another
-  // scheduling region.
-  for (unsigned Reg : DAG->getOutRegs()) {
-    for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
-      // Do reverse traversal
-      int ID = BlocksStruct.TopDownIndex2Block[Blocks.size()-1-i];
-      SIScheduleBlock *Block = Blocks[ID];
-      const std::set<unsigned> &OutRegs = Block->getOutRegs();
+  BlockSuccs.resize(Blocks.size());
+  BlockPreds.resize(Blocks.size());
+  InRegsForBlock.resize(Blocks.size());
+  OutRegsForBlock.resize(Blocks.size());
 
-      if (OutRegs.find(Reg) == OutRegs.end())
-        continue;
-
-      ++LiveOutRegsNumUsages[ID][Reg];
-      break;
-    }
-  }
-
-  // Fill LiveRegsConsumers for regs that were already
-  // defined before scheduling.
-  for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
+  for (unsigned i = 0; i < Blocks.size(); i++) {
     SIScheduleBlock *Block = Blocks[i];
-    for (unsigned Reg : Block->getInRegs()) {
-      bool Found = false;
-      for (SIScheduleBlock* Pred: Block->getPreds()) {
-        std::set<unsigned> PredOutRegs = Pred->getOutRegs();
-        std::set<unsigned>::iterator RegPos = PredOutRegs.find(Reg);
-
-        if (RegPos != PredOutRegs.end()) {
-          Found = true;
-          break;
-        }
-      }
-
-      if (!Found)
-        ++LiveRegsConsumers[Reg];
-    }
+    for (const auto &Succ : Block->getSuccs())
+      BlockSuccs[i].push_back(Succ.first->getID());
+    for (const auto &Pred : Block->getPreds())
+      BlockPreds[i].push_back(Pred->getID());
+    InRegsForBlock[i] = Block->getInRegs();
+    OutRegsForBlock[i] = Block->getOutRegs();
   }
 
-  for (unsigned i = 0, e = Blocks.size(); i != e; ++i) {
-    SIScheduleBlock *Block = Blocks[i];
-    if (BlockNumPredsLeft[i] == 0) {
-      ReadyBlocks.push_back(Block);
-    }
-  }
+  RPTracker.reset(new SISchedulerRPTracker(
+    DAG->getInRegs(),
+    DAG->getOutRegs(),
+    BlockSuccs,
+    BlockPreds,
+    InRegsForBlock,
+    OutRegsForBlock,
+    DAG->getMRI(),
+    DAG->getTRI(),
+    DAG->getVGPRSetID(),
+    DAG->getSGPRSetID()
+  ));
 
   while (SIScheduleBlock *Block = pickBlock()) {
     BlocksScheduled.push_back(Block);
@@ -1560,13 +1976,13 @@ bool SIScheduleBlockScheduler::tryCandidateRegUsage(SIBlockSchedCandidate &Cand,
 
 SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
   SIBlockSchedCandidate Cand;
-  std::vector<SIScheduleBlock*>::iterator Best;
+  unsigned VregCurrentUsage, SregCurrentUsage;
   SIScheduleBlock *Block;
+  SmallVector<unsigned, 16> ReadyBlocks = RPTracker->getReadyItems();
   if (ReadyBlocks.empty())
     return nullptr;
 
-  DAG->fillVgprSgprCost(LiveRegs.begin(), LiveRegs.end(),
-                        VregCurrentUsage, SregCurrentUsage);
+  RPTracker->getCurrentRegUsage(VregCurrentUsage, SregCurrentUsage);
   if (VregCurrentUsage > maxVregUsage)
     maxVregUsage = VregCurrentUsage;
   if (SregCurrentUsage > maxSregUsage)
@@ -1574,31 +1990,29 @@ SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
   DEBUG(
     dbgs() << "Picking New Blocks\n";
     dbgs() << "Available: ";
-    for (SIScheduleBlock* Block : ReadyBlocks)
-      dbgs() << Block->getID() << ' ';
+    for (unsigned ID : ReadyBlocks)
+      dbgs() << ID << ' ';
     dbgs() << "\nCurrent Live:\n";
-    for (unsigned Reg : LiveRegs)
-      dbgs() << PrintVRegOrUnit(Reg, DAG->getTRI()) << ' ';
+    RPTracker->printDebugLives();
     dbgs() << '\n';
     dbgs() << "Current VGPRs: " << VregCurrentUsage << '\n';
     dbgs() << "Current SGPRs: " << SregCurrentUsage << '\n';
   );
 
   Cand.Block = nullptr;
-  for (std::vector<SIScheduleBlock*>::iterator I = ReadyBlocks.begin(),
-       E = ReadyBlocks.end(); I != E; ++I) {
+  for (unsigned ID : ReadyBlocks) {
     SIBlockSchedCandidate TryCand;
-    TryCand.Block = *I;
+    int SGPRUsageDiff;
+
+    TryCand.Block = Blocks[ID];
     TryCand.IsHighLatency = TryCand.Block->isHighLatencyBlock();
-    TryCand.VGPRUsageDiff =
-      checkRegUsageImpact(TryCand.Block->getInRegs(),
-                          TryCand.Block->getOutRegs())[DAG->getVGPRSetID()];
+    RPTracker->checkRegUsageImpact(ID, TryCand.VGPRUsageDiff, SGPRUsageDiff);
     TryCand.NumSuccessors = TryCand.Block->getSuccs().size();
     TryCand.NumHighLatencySuccessors =
       TryCand.Block->getNumHighLatencySuccessors();
     TryCand.LastPosHighLatParentScheduled =
       (unsigned int) std::max<int> (0,
-         LastPosHighLatencyParentScheduled[TryCand.Block->getID()] -
+         LastPosHighLatencyParentScheduled[ID] -
            LastPosWaitedHighLatency);
     TryCand.Height = TryCand.Block->Height;
     // Try not to increase VGPR usage too much, else we may spill.
@@ -1613,7 +2027,6 @@ SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
     }
     if (TryCand.Reason != NoCand) {
       Cand.setBest(TryCand);
-      Best = I;
       DEBUG(dbgs() << "Best Current Choice: " << Cand.Block->getID() << ' '
                    << getReasonStr(Cand.Reason) << '\n');
     }
@@ -1630,96 +2043,26 @@ SIScheduleBlock *SIScheduleBlockScheduler::pickBlock() {
   );
 
   Block = Cand.Block;
-  ReadyBlocks.erase(Best);
   return Block;
 }
 
-// Tracking of currently alive registers to determine VGPR Usage.
-
-void SIScheduleBlockScheduler::addLiveRegs(std::set<unsigned> &Regs) {
-  for (unsigned Reg : Regs) {
-    // For now only track virtual registers.
-    if (!TargetRegisterInfo::isVirtualRegister(Reg))
-      continue;
-    // If not already in the live set, then add it.
-    (void) LiveRegs.insert(Reg);
-  }
-}
-
-void SIScheduleBlockScheduler::decreaseLiveRegs(SIScheduleBlock *Block,
-                                       std::set<unsigned> &Regs) {
-  for (unsigned Reg : Regs) {
-    // For now only track virtual registers.
-    std::set<unsigned>::iterator Pos = LiveRegs.find(Reg);
-    assert (Pos != LiveRegs.end() && // Reg must be live.
-               LiveRegsConsumers.find(Reg) != LiveRegsConsumers.end() &&
-               LiveRegsConsumers[Reg] >= 1);
-    --LiveRegsConsumers[Reg];
-    if (LiveRegsConsumers[Reg] == 0)
-      LiveRegs.erase(Pos);
-  }
-}
-
-void SIScheduleBlockScheduler::releaseBlockSuccs(SIScheduleBlock *Parent) {
-  for (const auto &Block : Parent->getSuccs()) {
-    if (--BlockNumPredsLeft[Block.first->getID()] == 0)
-      ReadyBlocks.push_back(Block.first);
-
-    if (Parent->isHighLatencyBlock() &&
-        Block.second == SIScheduleBlockLinkKind::Data)
-      LastPosHighLatencyParentScheduled[Block.first->getID()] = NumBlockScheduled;
-  }
-}
-
 void SIScheduleBlockScheduler::blockScheduled(SIScheduleBlock *Block) {
-  decreaseLiveRegs(Block, Block->getInRegs());
-  addLiveRegs(Block->getOutRegs());
-  releaseBlockSuccs(Block);
-  for (std::map<unsigned, unsigned>::iterator RegI =
-       LiveOutRegsNumUsages[Block->getID()].begin(),
-       E = LiveOutRegsNumUsages[Block->getID()].end(); RegI != E; ++RegI) {
-    std::pair<unsigned, unsigned> RegP = *RegI;
-    // We produce this register, thus it must not be previously alive.
-    assert(LiveRegsConsumers.find(RegP.first) == LiveRegsConsumers.end() ||
-           LiveRegsConsumers[RegP.first] == 0);
-    LiveRegsConsumers[RegP.first] += RegP.second;
+  unsigned ID = Block->getID();
+  RPTracker->itemScheduled(ID);
+
+  if (Block->isHighLatencyBlock()) {
+    for (const auto &Succ : Block->getSuccs()) {
+      if (Succ.second == SIScheduleBlockLinkKind::Data)
+        LastPosHighLatencyParentScheduled[Succ.first->getID()] =
+          NumBlockScheduled;
+    }
   }
-  if (LastPosHighLatencyParentScheduled[Block->getID()] >
+
+  if (LastPosHighLatencyParentScheduled[ID] >
         (unsigned)LastPosWaitedHighLatency)
     LastPosWaitedHighLatency =
-      LastPosHighLatencyParentScheduled[Block->getID()];
+      LastPosHighLatencyParentScheduled[ID];
   ++NumBlockScheduled;
-}
-
-std::vector<int>
-SIScheduleBlockScheduler::checkRegUsageImpact(std::set<unsigned> &InRegs,
-                                     std::set<unsigned> &OutRegs) {
-  std::vector<int> DiffSetPressure;
-  DiffSetPressure.assign(DAG->getTRI()->getNumRegPressureSets(), 0);
-
-  for (unsigned Reg : InRegs) {
-    // For now only track virtual registers.
-    if (!TargetRegisterInfo::isVirtualRegister(Reg))
-      continue;
-    if (LiveRegsConsumers[Reg] > 1)
-      continue;
-    PSetIterator PSetI = DAG->getMRI()->getPressureSets(Reg);
-    for (; PSetI.isValid(); ++PSetI) {
-      DiffSetPressure[*PSetI] -= PSetI.getWeight();
-    }
-  }
-
-  for (unsigned Reg : OutRegs) {
-    // For now only track virtual registers.
-    if (!TargetRegisterInfo::isVirtualRegister(Reg))
-      continue;
-    PSetIterator PSetI = DAG->getMRI()->getPressureSets(Reg);
-    for (; PSetI.isValid(); ++PSetI) {
-      DiffSetPressure[*PSetI] += PSetI.getWeight();
-    }
-  }
-
-  return DiffSetPressure;
 }
 
 // SIScheduler //
@@ -1841,37 +2184,6 @@ void SIScheduleDAGMI::moveLowLatencies() {
   }
 }
 
-void SIScheduleDAGMI::restoreSULinksLeft() {
-  for (unsigned i = 0, e = SUnits.size(); i != e; ++i) {
-    SUnits[i].isScheduled = false;
-    SUnits[i].WeakPredsLeft = SUnitsLinksBackup[i].WeakPredsLeft;
-    SUnits[i].NumPredsLeft = SUnitsLinksBackup[i].NumPredsLeft;
-    SUnits[i].WeakSuccsLeft = SUnitsLinksBackup[i].WeakSuccsLeft;
-    SUnits[i].NumSuccsLeft = SUnitsLinksBackup[i].NumSuccsLeft;
-  }
-}
-
-// Return the Vgpr and Sgpr usage corresponding to some virtual registers.
-template<typename _Iterator> void
-SIScheduleDAGMI::fillVgprSgprCost(_Iterator First, _Iterator End,
-                                  unsigned &VgprUsage, unsigned &SgprUsage) {
-  VgprUsage = 0;
-  SgprUsage = 0;
-  for (_Iterator RegI = First; RegI != End; ++RegI) {
-    unsigned Reg = *RegI;
-    // For now only track virtual registers
-    if (!TargetRegisterInfo::isVirtualRegister(Reg))
-      continue;
-    PSetIterator PSetI = MRI.getPressureSets(Reg);
-    for (; PSetI.isValid(); ++PSetI) {
-      if (*PSetI == VGPRSetID)
-        VgprUsage += PSetI.getWeight();
-      else if (*PSetI == SGPRSetID)
-        SgprUsage += PSetI.getWeight();
-    }
-  }
-}
-
 void SIScheduleDAGMI::schedule()
 {
   SmallVector<SUnit*, 8> TopRoots, BotRoots;
@@ -1981,8 +2293,10 @@ void SIScheduleDAGMI::schedule()
   for (std::vector<unsigned>::iterator I = ScheduledSUnits.begin(),
        E = ScheduledSUnits.end(); I != E; ++I) {
     SUnit *SU = &SUnits[*I];
+    SU->NumPredsLeft = 0; // To please scheduleMI
 
     scheduleMI(SU, true);
+    SU->isScheduled = true;
 
     DEBUG(dbgs() << "Scheduling SU(" << SU->NodeNum << ") "
                  << *SU->getInstr());
