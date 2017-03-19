@@ -41,6 +41,15 @@ struct RegisterMaskPair {
 
   RegisterMaskPair(unsigned RegUnit, LaneBitmask LaneMask)
       : RegUnit(RegUnit), LaneMask(LaneMask) {}
+
+  bool operator==(const RegisterMaskPair &RP) const {
+    return RegUnit == RP.RegUnit && LaneMask == RP.LaneMask;
+  }
+
+  bool operator<(const RegisterMaskPair &RP) const {
+    return RegUnit < RP.RegUnit ||
+      (RegUnit == RP.RegUnit && LaneMask < RP.LaneMask);
+  }
 };
 
 /// Base class for register pressure results.
