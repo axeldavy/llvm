@@ -682,6 +682,12 @@ bool ScheduleDAGTopologicalSort::IsReachable(const SUnit *SU,
   return HasLoop;
 }
 
+int ScheduleDAGTopologicalSort::getSUTopoIndex(const SUnit &SU)
+{
+  assert(!SU.isBoundaryNode());
+  return Node2Index[SU.NodeNum];
+}
+
 void ScheduleDAGTopologicalSort::Allocate(int n, int index) {
   Node2Index[n] = index;
   Index2Node[index] = n;

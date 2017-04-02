@@ -738,6 +738,11 @@ class TargetRegisterInfo;
     /// current node \p M.
     void RemovePred(SUnit *M, SUnit *N);
 
+    /// Maps SUnits to indexes of a topological ordering.
+    /// The index is between 0 and SUnits.count()-1.
+    /// Boundary SUnits are not mapped.
+    int getSUTopoIndex(const SUnit &SU);
+
     typedef std::vector<int>::iterator iterator;
     typedef std::vector<int>::const_iterator const_iterator;
     iterator begin() { return Index2Node.begin(); }
